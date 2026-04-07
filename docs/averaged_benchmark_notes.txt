@@ -1,0 +1,56 @@
+GPU Memory Benchmark – Averaged Measurements
+===========================================
+
+Location:
+src/benchmark/averaged_benchmark.cu
+
+Objective:
+Improve reliability of measurements by averaging multiple runs.
+
+Implementation Details:
+
+- Each benchmark (CPU, H2D, D2H, GPU) is executed multiple times
+- Number of iterations: 10
+- Final result is computed as the average
+
+Why averaging is important:
+- Reduces noise from system fluctuations
+- Provides more stable and reliable results
+- Makes results suitable for analysis and reporting
+
+Benchmarks Included:
+
+1. CPU Memory (RAM copy)
+   - Sequential memory copy
+   - Measures effective CPU memory bandwidth
+
+2. Host-to-Device Transfer
+   - CPU → GPU transfer via cudaMemcpy
+
+3. Device-to-Host Transfer
+   - GPU → CPU transfer via cudaMemcpy
+
+4. GPU Device Memory
+   - CUDA kernel operating on GPU memory
+
+Tested Data Sizes:
+1 MB, 4 MB, 16 MB, 64 MB, 256 MB, 512 MB
+
+Key Observations:
+
+- Averaging produces more stable values compared to single-run measurements
+- GPU memory bandwidth remains significantly higher than CPU and transfer bandwidth
+- PCIe transfer continues to be the primary bottleneck
+- CPU memory bandwidth varies but remains below GPU device bandwidth
+
+Current Status:
+
+- Baseline benchmark completed
+- Averaged benchmark implemented
+- Results are stable and ready for export and analysis
+
+Next Steps:
+
+- Export results to CSV format
+- Generate graphs for visualization
+- Extend benchmarks (random access, pinned memory)

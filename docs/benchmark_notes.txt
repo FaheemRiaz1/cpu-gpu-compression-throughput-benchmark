@@ -1,0 +1,61 @@
+GPU Memory Benchmark – Baseline Implementation
+==============================================
+
+Location:
+src/benchmark/baseline_benchmark.cu
+
+Objective:
+Measure and compare the performance of:
+- CPU memory access (RAM)
+- Host-to-Device (CPU → GPU) transfer
+- Device-to-Host (GPU → CPU) transfer
+- GPU device-memory access
+
+Implementation Details:
+
+1. CPU Benchmark:
+   - Sequential memory copy (array copy)
+   - Measures approximate RAM bandwidth
+
+2. Host-to-Device Transfer:
+   - Uses cudaMemcpy with cudaMemcpyHostToDevice
+   - Measures PCIe transfer from CPU to GPU
+
+3. Device-to-Host Transfer:
+   - Uses cudaMemcpy with cudaMemcpyDeviceToHost
+   - Measures PCIe transfer from GPU to CPU
+
+4. GPU Memory Benchmark:
+   - Simple CUDA kernel accesses data in GPU memory
+   - Measures GPU device-memory throughput
+
+Tested Data Sizes:
+1 MB, 4 MB, 16 MB, 64 MB, 256 MB, 512 MB
+
+Current Results Summary:
+
+- CPU bandwidth: ~11–24 GB/s
+- H2D bandwidth: ~6 GB/s
+- D2H bandwidth: ~6.6 GB/s
+- GPU bandwidth: ~200–260 GB/s
+
+Key Observations:
+
+- GPU device memory is significantly faster than CPU memory
+- Data transfer between CPU and GPU is much slower than GPU internal memory access
+- PCIe transfer is a major bottleneck in GPU-based systems
+- GPU performance benefits depend on minimizing data transfer overhead
+
+Current Status:
+
+- CUDA environment successfully set up
+- Baseline benchmark implemented and tested
+- Initial measurements collected across multiple data sizes
+
+Next Steps:
+
+- Repeat experiments and compute averages
+- Export results to CSV format
+- Generate graphs for analysis
+- Compare sequential vs random memory access
+- Explore pinned memory and unified memory

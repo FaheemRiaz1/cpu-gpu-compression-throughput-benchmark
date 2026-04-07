@@ -1,0 +1,26 @@
+# Compiled files
+*.o
+*.out
+*.exe
+
+# CUDA build
+*.ptx
+*.cubin
+
+# Binaries
+bin/
+
+# Python env
+venv/
+
+# OS junk
+.DS_Store
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+
+# Ignore large/unnecessary results (optional)
+results/*.txt
