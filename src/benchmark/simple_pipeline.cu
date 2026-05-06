@@ -3,7 +3,6 @@
 #include <chrono>
 #include <fstream>
 #include <iomanip>
-#include <string>
 #include <cuda_runtime.h>
 
 #define CHECK_CUDA(call) \
@@ -41,15 +40,13 @@ std::vector<RLEPair> compress(const std::vector<int>& input) {
     int count = 1;
 
     for (size_t i = 1; i < input.size(); i++) {
-        if (input[i] == curr) {
-            count++;
-        } else {
+        if (input[i] == curr) count++;
+        else {
             out.push_back({curr, count});
             curr = input[i];
             count = 1;
         }
     }
-
     out.push_back({curr, count});
     return out;
 }
@@ -61,22 +58,17 @@ __global__ void decompress_kernel(RLEPair* comp, int* out, int num_pairs, int N)
     if (idx < num_pairs) {
         int start = 0;
 
-        for (int i = 0; i < idx; i++) {
+        // O(n²) bottleneck
+        for (int i = 0; i < idx; i++)
             start += comp[i].count;
-        }
 
         for (int j = 0; j < comp[idx].count; j++) {
             int out_idx = start + j;
 
             int val = comp[idx].value;
 
-            // fake work
-            val = val * 2;
-            val = val / 2;
-
-            if (out_idx < N) {
+            if (out_idx < N)
                 out[out_idx] = val;
-            }
         }
     }
 }
@@ -84,19 +76,28 @@ __global__ void decompress_kernel(RLEPair* comp, int* out, int num_pairs, int N)
 // ---------------- GPU COMPUTE ----------------
 __global__ void compute_kernel(int* data, int N) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
+
     if (i < N) {
-        data[i] *= 2;
+        int val = data[i];
+
+        // Slightly heavier compute (important)
+        for (int k = 0; k < 50; k++) {
+            val = val * 2 + 1;
+            val = val / 2;
+        }
+
+        data[i] = val;
     }
 }
 
 // ---------------- MAIN ----------------
 int main() {
-
+    std::system("mkdir -p results");
+    std::system("mkdir -p results/simple_pipeline");
+    std::system("mkdir -p results/simple_pipeline/csv_file");
+    std::system("mkdir -p results/graphs");
     std::vector<int> run_lengths = {2, 32, 128};
     std::vector<int> sizes = {1, 4, 16, 64, 128};
-
-    std::ofstream csv("results/simple_pipeline/csv_file/simple_results.csv");
-    csv << "MB,RunLen,BaselineGBs,CompressedGBs\n";
 
     std::cout << "\n======= SIMPLE PIPELINE =======\n\n";
 
@@ -117,7 +118,9 @@ int main() {
             size_t bytes = mb * 1024 * 1024;
             size_t N = bytes / sizeof(int);
 
-            auto data = generate_data(N, run_len);
+            // ORIGINAL DATA (important)
+            auto original_data = generate_data(N, run_len);
+            auto data = original_data;
 
             int* d_data;
             CHECK_CUDA(cudaMalloc(&d_data, bytes));
@@ -139,6 +142,8 @@ int main() {
             double base_gbps = (bytes / 1e9) / (base_ms / 1000.0);
 
             // ---------------- COMPRESSED ----------------
+            data = original_data;  // 🔥 RESET DATA
+
             start = std::chrono::high_resolution_clock::now();
 
             auto comp = compress(data);
@@ -167,10 +172,8 @@ int main() {
             // ---------------- RESULT ----------------
             std::string winner = (comp_gbps > base_gbps) ? "COMP" : "BASE";
 
-            if (winner == "COMP")
-                std::cout << "\033[32m";
-            else
-                std::cout << "\033[31m";
+            if (winner == "COMP") std::cout << "\033[32m";
+            else std::cout << "\033[31m";
 
             std::cout << std::setw(6) << mb
                       << std::setw(8) << run_len
@@ -180,8 +183,6 @@ int main() {
                       << "\n";
 
             std::cout << "\033[0m";
-
-            csv << mb << "," << run_len << "," << base_gbps << "," << comp_gbps << "\n";
 
             cudaFree(d_comp);
             cudaFree(d_data);

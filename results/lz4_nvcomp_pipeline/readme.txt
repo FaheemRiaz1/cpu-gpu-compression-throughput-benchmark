@@ -1,0 +1,216 @@
+# LZ4 + nvCOMP Pipeline Benchmark (Single File)
+
+## Description
+
+This file implements a **CPU–GPU pipeline** to evaluate the impact of compression on data transfer throughput.
+
+Pipeline implemented:
+
+CPU (LZ4 Compression) → H2D (Compressed) → GPU (nvCOMP Decompression) → GPU Compute → D2H
+
+It compares against a **baseline pipeline** without compression.
+
+---
+
+## File Location
+
+```bash
+src/benchmark/parallel_cpu_lz4_nvcomp_full_pipeline.cu
+```
+
+---
+
+## Dependencies
+
+### 1. CUDA
+
+Check:
+
+```bash
+nvcc --version
+```
+
+---
+
+### 2. LZ4 (CPU Compression)
+
+Install:
+
+```bash
+sudo apt install liblz4-dev
+```
+
+---
+
+### 3. nvCOMP (GPU Decompression)
+
+Install via Python environment:
+
+```bash
+python -m venv nvcomp_env
+source nvcomp_env/bin/activate
+
+pip install nvidia-nvcomp-cu12
+```
+
+Set library path:
+
+```bash
+export LD_LIBRARY_PATH=~/nvcomp_env/lib/python3.12/site-packages/nvidia/libnvcomp/lib64:$LD_LIBRARY_PATH
+```
+
+---
+
+## Compilation
+
+Run from root directory:
+
+```bash
+nvcc src/benchmark/parallel_cpu_lz4_nvcomp_full_pipeline.cu \
+-o bin/final_pipeline \
+-I ~/nvcomp_env/lib/python3.12/site-packages/nvidia/libnvcomp/include \
+-L ~/nvcomp_env/lib/python3.12/site-packages/nvidia/libnvcomp/lib64 \
+-lnvcomp -llz4
+```
+
+---
+
+##Execution
+
+```bash
+./bin/final_pipeline
+```
+
+---
+## Output
+
+### Console Output
+
+Displays:
+
+* MODE (HIGH / MEDIUM / RANDOM)
+* Data size (MB)
+* Compression ratio
+* Throughput:
+
+  * BASE
+  * PIPE (physical)
+  * PIPE (effective)
+* Winner (BASE or PIPE)
+
+---
+
+### CSV Output
+
+Saved at:
+
+```bash
+results/lz4_nvcomp_pipeline/csv_file/parallel_cpu_lz4_nvcomp_full_pipeline_results.csv
+```
+```bash
+results/lz4_nvcomp_pipeline/csv_file/parallel_cpu_lz4_nvcomp_full_pipeline_detailed_runs.csv
+```
+
+---
+
+## Data Modes
+
+* HIGH → highly compressible (repetitions)
+* MEDIUM → moderate patterns
+* RANDOM → no compression
+
+---
+
+##Key Implementation Details
+
+### CPU Side
+
+* Data is compressed using:
+
+```cpp
+LZ4_compress_default(...)
+```
+
+* Compression is performed **once per dataset**
+
+---
+
+### GPU Side
+
+#### Decompression (nvCOMP)
+
+```cpp
+nvcompBatchedLZ4DecompressAsync(...)
+```
+
+* Batched parallel decompression
+* Each chunk decompressed independently on GPU
+
+#### Compute Kernel
+
+```cpp
+data[i] *= 2;
+```
+
+* Simple operation to isolate transfer/compression effects
+
+---
+
+## Measured Components
+
+* H2D transfer (compressed)
+* GPU decompression time
+* GPU kernel execution
+* D2H transfer
+* Total pipeline time
+---
+
+## Throughput Metrics
+
+* **Base GB/s** → no compression
+* **Pipe (phys)** → based on compressed size
+* **Pipe (eff)** → based on original size (actual speedup)
+
+---
+## Notes
+
+* CPU compression time is **measured separately**
+* Throughput comparison focuses on transfer + GPU work
+* Small data sizes are dominated by overhead
+* Large data sizes benefit from compression
+
+---
+
+## Expected Behavior
+
+* SMALL (4–16 MB):
+
+  * Baseline faster (overhead dominates)
+
+* MEDIUM (64 MB):
+
+  * Comparable performance
+
+* LARGE (256+ MB):
+
+  * Pipeline outperforms baseline
+
+* RANDOM data:
+
+  * No benefit from compression
+
+---
+
+## Conclusion
+
+This pipeline demonstrates:
+
+* Compression reduces transfer cost
+* GPU decompression scales well
+* Performance depends on:
+
+  * data compressibility
+  * data size
+
+---
+
