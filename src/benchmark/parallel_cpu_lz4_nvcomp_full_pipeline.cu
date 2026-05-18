@@ -476,7 +476,7 @@ int main() {
                     );
                     CUDA_CHECK(cudaStreamSynchronize(stream));
 
-                    // Decompress all chunks on the GPU using nvCOMP.
+                    // Decompress all chunks on the GPU using nvCOMP. Over-riding
                     NVCOMP_CHECK(
                         nvcompBatchedLZ4DecompressAsync(
                             (const void* const*)d_comp_ptrs,

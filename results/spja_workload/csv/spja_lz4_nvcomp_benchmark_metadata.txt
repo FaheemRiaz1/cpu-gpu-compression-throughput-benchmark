@@ -1,0 +1,20 @@
+Benchmark metadata
+==================
+Dataset: official tpch-dbgen SF=1
+Input format: converted .tbl files to binary int32 columns
+Columns: orderkey, quantity, extendedprice
+Query: LINEITEM + ORDERS + CUSTOMER using orderkey -> custkey -> nation
+Rows: 6001215
+Input MiB: 68.6785
+Total chunks per column: 46
+Chunk size bytes: 524288
+Chunk size KiB: 512
+GPU batch chunks: 86
+Compression: LZ4_HC level 8
+GPU decompression: nvCOMP LZ4
+Execution: CPU/GPU overlap using std::thread + CUDA stream
+Assignment trials per split: 5
+Warmup runs per assignment: 5
+Timed runs per assignment: 20
+Total compression reduction percent: 46.3246
+Preprocess compression ms not counted: 4967.11

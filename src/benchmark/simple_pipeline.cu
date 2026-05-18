@@ -1,3 +1,5 @@
+// This file compromises of RLE implementation forcompresiion
+
 #include <iostream>
 #include <vector>
 #include <chrono>

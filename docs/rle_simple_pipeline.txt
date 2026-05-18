@@ -1,0 +1,166 @@
+============================================================
+SIMPLE PIPELINE (CPU–GPU COMPRESSION BENCHMARK)
+============================================================
+
+DESCRIPTION
+
+This program compares two data processing pipelines:
+
+1. Baseline Pipeline:
+   CPU → GPU (H2D) → GPU Compute → GPU → CPU (D2H)
+
+2. Compressed Pipeline:
+   CPU Compression (RLE)
+   → Transfer compressed data (H2D)
+   → GPU Decompression
+   → GPU Compute
+   → GPU → CPU (D2H)
+
+The program measures total throughput (GB/s) for both approaches.
+
+============================================================
+HOW TO COMPILE
+============================================================
+
+From project root:
+
+nvcc -O2 src/benchmark/simple_pipeline.cu -o bin/simple_pipeline
+
+============================================================
+HOW TO RUN
+============================================================
+
+1. Create output folder (required):
+
+mkdir -p results/simple_pipeline/csv_file
+
+2. Run the program:
+
+./bin/simple_pipeline
+
+============================================================
+OUTPUT
+============================================================
+
+Terminal output shows:
+
+MB   RunLen   Base GB/s   Comp GB/s   Winner
+
+MB
+→ data size
+
+RunLen
+→ compression level
+
+Base GB/s
+→ baseline throughput
+
+Comp GB/s
+→ compressed pipeline throughput
+
+Winner
+→ faster pipeline (BASE or COMP)
+
+============================================================
+CSV OUTPUT
+============================================================
+
+Results are saved in:
+
+results/simple_pipeline/csv_file/simple_results.csv
+
+Format:
+
+MB,RunLen,BaselineGBs,CompressedGBs
+
+============================================================
+EXPERIMENT SETTINGS
+============================================================
+
+Data Sizes:
+
+1 MB
+4 MB
+16 MB
+64 MB
+128 MB
+
+Run Lengths:
+
+2
+→ low compression
+
+32
+→ medium compression
+
+128
+→ high compression
+
+============================================================
+IMPORTANT NOTES
+============================================================
+
+CPU compression time IS included in measurement.
+
+GPU operations are synchronized using cudaDeviceSynchronize().
+
+Decompression is implemented on GPU using a simple kernel.
+
+============================================================
+KNOWN LIMITATIONS
+============================================================
+
+GPU decompression kernel is inefficient (O(n²)).
+
+Performance degrades for large input sizes.
+
+RLE compression is basic and not optimized.
+
+============================================================
+EXPECTED BEHAVIOR
+============================================================
+
+run_len = 2:
+
+Compression ineffective.
+BASE should win.
+
+------------------------------------------------------------
+
+run_len = 32:
+
+Moderate compression.
+Mostly BASE wins.
+
+------------------------------------------------------------
+
+run_len = 128:
+
+Strong compression.
+COMP may win for small sizes.
+
+For large sizes, BASE may win due to kernel inefficiency.
+
+============================================================
+PURPOSE
+============================================================
+
+This pipeline is a baseline implementation to study:
+
+- Effect of compression on GPU data transfer
+- Trade-offs between compression overhead and transfer speed
+- Impact of decompression cost on overall performance
+
+============================================================
+FILE
+============================================================
+
+Source file:
+
+src/benchmark/simple_pipeline.cu
+
+Executable:
+
+bin/simple_pipeline
+
+============================================================

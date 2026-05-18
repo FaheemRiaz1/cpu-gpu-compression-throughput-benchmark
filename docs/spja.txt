@@ -1,0 +1,142 @@
+============================================================
+TPC-H CPU/GPU SPJA BENCHMARK RUN GUIDE
+============================================================
+
+This guide explains how to run the current CPU/GPU compressed
+SPJA benchmark.
+
+The benchmark uses official TPC-H SF=1 data. The .tbl files are
+first compressed into .tbl.lz4 files, then converted into binary
+int32 column files. The C++/CUDA benchmark reads these binary
+columns, compresses them chunk-wise with LZ4_HC, and evaluates
+CPU/GPU split execution using CPU LZ4 decompression and GPU
+nvCOMP LZ4 decompression.
+
+Pipeline:
+
+TPC-H .tbl files
+-> compress_tbl_lz4
+-> .tbl.lz4 files
+-> binary column files
+-> C++/CUDA benchmark
+-> CSV results and graphs
+
+============================================================
+1. Generate TPC-H data
+============================================================
+
+mkdir -p tools
+cd tools
+git clone https://github.com/electrum/tpch-dbgen.git
+cd tpch-dbgen
+make
+
+mkdir -p ../../data/tpch_real/sf1
+./dbgen -s 1 -f
+mv *.tbl ../../data/tpch_real/sf1/
+
+cd ../../
+
+Expected files:
+
+data/tpch_real/sf1/lineitem.tbl
+data/tpch_real/sf1/orders.tbl
+data/tpch_real/sf1/customer.tbl
+data/tpch_real/sf1/part.tbl
+
+============================================================
+2. Compress .tbl files
+============================================================
+
+g++ -O3 -std=c++17 \
+  src/tools/compress_tbl_lz4.cpp \
+  -o bin/compress_tbl_lz4 \
+  -llz4
+
+./bin/compress_tbl_lz4 data/tpch_real/sf1
+
+Expected output:
+
+data/tpch_real/sf1/compressed/lineitem.tbl.lz4
+data/tpch_real/sf1/compressed/orders.tbl.lz4
+data/tpch_real/sf1/compressed/customer.tbl.lz4
+data/tpch_real/sf1/compressed/part.tbl.lz4
+
+============================================================
+3. Convert compressed tables to binary columns
+============================================================
+
+source ~/nvcomp_env/bin/activate
+
+python3 scripts/tpch_columnar/convert_dbgen_tbl_to_bin.py
+
+Important output files:
+
+data/tpch_columnar/orderkey_sf1.bin
+data/tpch_columnar/quantity_sf1.bin
+data/tpch_columnar/extendedprice_sf1.bin
+data/tpch_columnar/order_custkey_sf1.bin
+data/tpch_columnar/customer_nation_sf1.bin
+
+============================================================
+4. Set nvCOMP library path
+============================================================
+
+export LD_LIBRARY_PATH=~/nvcomp_env/lib/python3.12/site-packages/nvidia/libnvcomp/lib64:$LD_LIBRARY_PATH
+
+============================================================
+5. Compile benchmark
+============================================================
+
+nvcc -std=c++17 -O3 \
+  -I ~/nvcomp_env/lib/python3.12/site-packages/nvidia/libnvcomp/include \
+  src/benchmark/spja_lz4_nvcomp_split_overlap.cu \
+  -L ~/nvcomp_env/lib/python3.12/site-packages/nvidia/libnvcomp/lib64 \
+  -lnvcomp -llz4 \
+  -o bin/spja_lz4_nvcomp_split_overlap
+
+============================================================
+6. Run benchmark
+============================================================
+
+LD_LIBRARY_PATH=~/nvcomp_env/lib/python3.12/site-packages/nvidia/libnvcomp/lib64:$LD_LIBRARY_PATH \
+./bin/spja_lz4_nvcomp_split_overlap
+
+============================================================
+7. Output files
+============================================================
+
+CSV results:
+
+results/spja_workload/csv/
+
+Important files:
+
+spja_lz4_nvcomp_split_overlap_results.csv
+spja_lz4_nvcomp_split_overlap_detailed_trials.csv
+spja_lz4_nvcomp_compression_stats.csv
+spja_lz4_nvcomp_benchmark_metadata.txt
+spja_lz4_nvcomp_summary.txt
+
+Graphs:
+
+results/spja_workload/graphs/
+
+============================================================
+8. Generate graphs
+============================================================
+
+python results/spja_workload/graph_plotting/plot_throughput.py
+python results/spja_workload/graph_plotting/plot_overlap.py
+python results/spja_workload/graph_plotting/line_plot.py
+
+============================================================
+Notes
+============================================================
+
+- Compression time is treated as preprocessing.
+- The benchmark measures decompression, transfer, query execution,
+  and result combination.
+- Correctness is checked against a full CPU reference result.
+- The current query uses LINEITEM, ORDERS, and CUSTOMER through
+  lookup arrays.
