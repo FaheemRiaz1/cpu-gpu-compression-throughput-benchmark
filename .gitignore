@@ -24,3 +24,27 @@ venv/
 
 # Ignore large/unnecessary results (optional)
 results/*.txt
+
+
+# ignoring backup files
+src/benchmark/spja_hybrid_cpu_gpu_split_backup.cu
+
+# Archives / old experiments
+archive/
+
+# Generated TPC-H binary data
+data/
+*.bin
+
+# Local test files
+test
+c
+
+# Compiled helper binaries inside scripts
+scripts/tpch_columnar/check_columnar_lz4_ratio
+scripts/tpch_columnar/check_columnar_lz4_delta_ratio
+src/benchmark/spja_cpu_gpu_split.cu
+results/spja_workload/csv/spja_lz4_nvcomp_hybrid_split_results.csv
+results/spja_workload/graph_plotting/plot_overlap.py
+results/spja_workload/graphs/tpch_area_sweet_spot.png
+tools/tpch-dbgen/
