@@ -566,6 +566,250 @@ static void build_fair_chunk_assignment(
     std::sort(gpu_chunk_ids.begin(), gpu_chunk_ids.end());
 }
 
+
+// ------------------------------------------------------------
+// Multi-threaded CPU processing for CPU-owned chunks.
+// Each worker thread decompresses and evaluates a subset of chunks.
+// This keeps the original benchmark logic unchanged:
+//   - same compressed chunks
+//   - same CPU LZ4 decompression
+//   - same SPJA query
+//   - same correctness result
+// Only the CPU-owned chunk processing is parallelized.
+// ------------------------------------------------------------
+static unsigned long long cpu_process_chunks_multithreaded(
+    const std::vector<size_t>& cpu_chunk_ids,
+    const CompressedColumn& comp_partkey,
+    const CompressedColumn& comp_quantity,
+    const CompressedColumn& comp_extendedprice,
+    const std::vector<int>& host_order_custkey,
+    const std::vector<int>& host_customer_nation,
+    size_t n_rows,
+    size_t chunk_rows,
+    int order_count,
+    int customer_count,
+    int target_nation,
+    int requested_cpu_threads,
+    double& cpu_decomp_ms,
+    double& cpu_spja_ms,
+    double& cpu_total_ms
+) {
+    auto cpu_total_start =
+        std::chrono::high_resolution_clock::now();
+
+    cpu_decomp_ms = 0.0;
+    cpu_spja_ms = 0.0;
+    cpu_total_ms = 0.0;
+
+    if (cpu_chunk_ids.empty()) {
+        return 0ULL;
+    }
+
+    const int actual_threads =
+        std::max(
+            1,
+            std::min(
+                requested_cpu_threads,
+                static_cast<int>(cpu_chunk_ids.size())
+            )
+        );
+
+    std::vector<unsigned long long> partial_sums(
+        static_cast<size_t>(actual_threads),
+        0ULL
+    );
+
+    std::vector<double> worker_decomp_ms(
+        static_cast<size_t>(actual_threads),
+        0.0
+    );
+
+    std::vector<double> worker_spja_ms(
+        static_cast<size_t>(actual_threads),
+        0.0
+    );
+
+    std::vector<std::exception_ptr> worker_exceptions(
+        static_cast<size_t>(actual_threads),
+        nullptr
+    );
+
+    std::vector<std::thread> workers;
+    workers.reserve(static_cast<size_t>(actual_threads));
+
+    const size_t chunks_per_thread =
+        (cpu_chunk_ids.size() +
+         static_cast<size_t>(actual_threads) - 1) /
+        static_cast<size_t>(actual_threads);
+
+    for (int t = 0; t < actual_threads; ++t) {
+        workers.emplace_back([&, t]() {
+            try {
+                const size_t begin =
+                    static_cast<size_t>(t) * chunks_per_thread;
+
+                const size_t end =
+                    std::min(
+                        begin + chunks_per_thread,
+                        cpu_chunk_ids.size()
+                    );
+
+                if (begin >= end) {
+                    return;
+                }
+
+                std::vector<int> local_partkey;
+                std::vector<int> local_quantity;
+                std::vector<int> local_extendedprice;
+
+                unsigned long long local_sum = 0ULL;
+                double local_decomp_ms = 0.0;
+                double local_spja_ms = 0.0;
+
+                for (size_t idx = begin; idx < end; ++idx) {
+                    const size_t c = cpu_chunk_ids[idx];
+
+                    const size_t global_start =
+                        c * chunk_rows;
+
+                    const size_t rows_this =
+                        std::min(chunk_rows, n_rows - global_start);
+
+                    const int expected_bytes =
+                        static_cast<int>(rows_this * sizeof(int));
+
+                    local_partkey.resize(rows_this);
+                    local_quantity.resize(rows_this);
+                    local_extendedprice.resize(rows_this);
+
+                    auto decomp_start =
+                        std::chrono::high_resolution_clock::now();
+
+                    const int partkey_decompressed =
+                        LZ4_decompress_safe(
+                            comp_partkey.comp_chunks[c].data(),
+                            reinterpret_cast<char*>(local_partkey.data()),
+                            static_cast<int>(comp_partkey.comp_sizes[c]),
+                            expected_bytes
+                        );
+
+                    if (partkey_decompressed != expected_bytes) {
+                        throw std::runtime_error(
+                            "CPU LZ4 orderkey decompression failed."
+                        );
+                    }
+
+                    const int quantity_decompressed =
+                        LZ4_decompress_safe(
+                            comp_quantity.comp_chunks[c].data(),
+                            reinterpret_cast<char*>(local_quantity.data()),
+                            static_cast<int>(comp_quantity.comp_sizes[c]),
+                            expected_bytes
+                        );
+
+                    if (quantity_decompressed != expected_bytes) {
+                        throw std::runtime_error(
+                            "CPU LZ4 quantity decompression failed."
+                        );
+                    }
+
+                    const int extendedprice_decompressed =
+                        LZ4_decompress_safe(
+                            comp_extendedprice.comp_chunks[c].data(),
+                            reinterpret_cast<char*>(local_extendedprice.data()),
+                            static_cast<int>(comp_extendedprice.comp_sizes[c]),
+                            expected_bytes
+                        );
+
+                    if (extendedprice_decompressed != expected_bytes) {
+                        throw std::runtime_error(
+                            "CPU LZ4 extendedprice decompression failed."
+                        );
+                    }
+
+                    auto decomp_end =
+                        std::chrono::high_resolution_clock::now();
+
+                    auto spja_start =
+                        std::chrono::high_resolution_clock::now();
+
+                    local_sum +=
+                        spja_cpu_columnar(
+                            local_partkey.data(),
+                            local_quantity.data(),
+                            local_extendedprice.data(),
+                            host_order_custkey.data(),
+                            host_customer_nation.data(),
+                            rows_this,
+                            order_count,
+                            customer_count,
+                            target_nation
+                        );
+
+                    auto spja_end =
+                        std::chrono::high_resolution_clock::now();
+
+                    local_decomp_ms +=
+                        ms_between(decomp_start, decomp_end);
+
+                    local_spja_ms +=
+                        ms_between(spja_start, spja_end);
+                }
+
+                partial_sums[static_cast<size_t>(t)] = local_sum;
+                worker_decomp_ms[static_cast<size_t>(t)] = local_decomp_ms;
+                worker_spja_ms[static_cast<size_t>(t)] = local_spja_ms;
+            }
+            catch (...) {
+                worker_exceptions[static_cast<size_t>(t)] =
+                    std::current_exception();
+            }
+        });
+    }
+
+    for (auto& worker : workers) {
+        worker.join();
+    }
+
+    for (const auto& ex : worker_exceptions) {
+        if (ex) {
+            std::rethrow_exception(ex);
+        }
+    }
+
+    unsigned long long total_sum = 0ULL;
+
+    for (unsigned long long v : partial_sums) {
+        total_sum += v;
+    }
+
+    /*
+       The CPU workers run in parallel, so summing all worker times would
+       over-report the wall-clock cost. For stage columns, use the slowest
+       worker's decompression/query time as a critical-path estimate.
+       CPU_Total_ms remains the main wall-clock CPU-side value.
+    */
+    cpu_decomp_ms =
+        *std::max_element(
+            worker_decomp_ms.begin(),
+            worker_decomp_ms.end()
+        );
+
+    cpu_spja_ms =
+        *std::max_element(
+            worker_spja_ms.begin(),
+            worker_spja_ms.end()
+        );
+
+    auto cpu_total_end =
+        std::chrono::high_resolution_clock::now();
+
+    cpu_total_ms =
+        ms_between(cpu_total_start, cpu_total_end);
+
+    return total_sum;
+}
+
 // ------------------------------------------------------------
 // Main benchmark
 // ------------------------------------------------------------
@@ -608,6 +852,14 @@ int main() {
         const int warmup = 5;
         const int iterations = 20;
         const int assignment_trials = 5;
+
+        const unsigned int detected_cpu_threads =
+            std::thread::hardware_concurrency();
+
+        const int cpu_worker_threads =
+            (detected_cpu_threads > 0)
+                ? static_cast<int>(std::min(36u, detected_cpu_threads))
+                : 36;
 
         const bool detailed_gpu_stage_timing = true;
 
@@ -669,6 +921,7 @@ int main() {
         std::cout << "  Warmup runs per assignment: " << warmup << "\n";
         std::cout << "  Timed runs per assignment: " << iterations << "\n";
         std::cout << "  Assignment trials per split: " << assignment_trials << "\n";
+        std::cout << "  CPU worker threads: " << cpu_worker_threads << "\n";
         std::cout << "  Execution mode: CPU/GPU overlap using std::thread + CUDA stream\n";
         std::cout << "  Chunk assignment: multiple deterministic fair assignments\n\n";
 
@@ -1049,10 +1302,6 @@ int main() {
                         std::max(max_batch_count, batch.comp_sizes.size());
                 }
 
-                std::vector<int> cpu_partkey(cpu_rows);
-                std::vector<int> cpu_quantity(cpu_rows);
-                std::vector<int> cpu_extendedprice(cpu_rows);
-
                 cudaStream_t stream;
                 CUDA_CHECK(cudaStreamCreate(&stream));
 
@@ -1322,113 +1571,24 @@ int main() {
 
                     std::thread cpu_thread([&]() {
                         try {
-                            auto cpu_start =
-                                std::chrono::high_resolution_clock::now();
-
-                            auto cpu_decomp_start =
-                                std::chrono::high_resolution_clock::now();
-
-                            if (!cpu_chunk_ids.empty()) {
-                                size_t local_row_offset = 0;
-
-                                for (size_t idx = 0;
-                                     idx < cpu_chunk_ids.size();
-                                     ++idx) {
-
-                                    const size_t c = cpu_chunk_ids[idx];
-
-                                    const size_t global_start =
-                                        c * chunk_rows;
-
-                                    const size_t rows_this =
-                                        std::min(
-                                            chunk_rows,
-                                            n_rows - global_start
-                                        );
-
-                                    const int expected_bytes =
-                                        static_cast<int>(
-                                            rows_this * sizeof(int)
-                                        );
-
-                                    const CompressedColumn* cols[3] = {
-                                        &comp_partkey,
-                                        &comp_quantity,
-                                        &comp_extendedprice
-                                    };
-
-                                    int* dst_cols[3] = {
-                                        cpu_partkey.data(),
-                                        cpu_quantity.data(),
-                                        cpu_extendedprice.data()
-                                    };
-
-                                    for (int col = 0; col < 3; ++col) {
-                                        const CompressedColumn& cc =
-                                            *cols[col];
-
-                                        const int compressed_size =
-                                            static_cast<int>(
-                                                cc.comp_sizes[c]
-                                            );
-
-                                        const int decompressed_size =
-                                            LZ4_decompress_safe(
-                                                cc.comp_chunks[c].data(),
-                                                reinterpret_cast<char*>(
-                                                    dst_cols[col] +
-                                                    local_row_offset
-                                                ),
-                                                compressed_size,
-                                                expected_bytes
-                                            );
-
-                                        if (decompressed_size != expected_bytes) {
-                                            throw std::runtime_error(
-                                                "CPU LZ4 column decompression failed."
-                                            );
-                                        }
-                                    }
-
-                                    local_row_offset += rows_this;
-                                }
-                            }
-
-                            auto cpu_decomp_end =
-                                std::chrono::high_resolution_clock::now();
-
-                            auto cpu_spja_start =
-                                std::chrono::high_resolution_clock::now();
-
-                            if (cpu_rows > 0) {
-                                    cpu_result =
-                                        spja_cpu_columnar(
-                                            cpu_partkey.data(),          // actually orderkey now
-                                            cpu_quantity.data(),
-                                            cpu_extendedprice.data(),
-                                            host_order_custkey.data(),
-                                            host_customer_nation.data(),
-                                            cpu_rows,
-                                            order_count,
-                                            customer_count,
-                                            target_nation
-                                        );
-                            }
-
-                            auto cpu_spja_end =
-                                std::chrono::high_resolution_clock::now();
-
-                            auto cpu_end =
-                                std::chrono::high_resolution_clock::now();
-
-                            cpu_decomp_ms =
-                                ms_between(cpu_decomp_start, cpu_decomp_end);
-
-                            cpu_spja_ms =
-                                ms_between(cpu_spja_start, cpu_spja_end);
-
-                            cpu_total_ms =
-                                ms_between(cpu_start, cpu_end);
+                            cpu_result =
+                                cpu_process_chunks_multithreaded(
+                                    cpu_chunk_ids,
+                                    comp_partkey,
+                                    comp_quantity,
+                                    comp_extendedprice,
+                                    host_order_custkey,
+                                    host_customer_nation,
+                                    n_rows,
+                                    chunk_rows,
+                                    order_count,
+                                    customer_count,
+                                    target_nation,
+                                    cpu_worker_threads,
+                                    cpu_decomp_ms,
+                                    cpu_spja_ms,
+                                    cpu_total_ms
+                                );
                         }
                         catch (...) {
                             cpu_exception = std::current_exception();
@@ -2116,3 +2276,6 @@ int main() {
         return 1;
     }
 }
+
+// nvcc -std=c++17 -O3   -I ~/nvcomp_env/lib/python3.12/site-packages/nvidia/libnvcomp/include   src/benchmark/spja_lz4_nvcomp_split_overlap.cu   -L ~/nvcomp_env/lib/python3.12/site-packages/nvidia/libnvcomp/lib64   -lnvcomp -llz4   -o bin/spja_lz4_nvcomp_split_overlap
+// LD_LIBRARY_PATH=~/nvcomp_env/lib/python3.12/site-packages/nvidia/libnvcomp/lib64:$LD_LIBRARY_PATH ./bin/spja_lz4_nvcomp_split_overlap

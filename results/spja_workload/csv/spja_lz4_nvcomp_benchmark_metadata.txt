@@ -17,4 +17,4 @@ Assignment trials per split: 5
 Warmup runs per assignment: 5
 Timed runs per assignment: 20
 Total compression reduction percent: 46.3246
-Preprocess compression ms not counted: 4389.05
+Preprocess compression ms not counted: 3861.44
