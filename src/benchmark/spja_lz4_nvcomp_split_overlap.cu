@@ -569,13 +569,6 @@ static void build_fair_chunk_assignment(
 
 // ------------------------------------------------------------
 // Multi-threaded CPU processing for CPU-owned chunks.
-// Each worker thread decompresses and evaluates a subset of chunks.
-// This keeps the original benchmark logic unchanged:
-//   - same compressed chunks
-//   - same CPU LZ4 decompression
-//   - same SPJA query
-//   - same correctness result
-// Only the CPU-owned chunk processing is parallelized.
 // ------------------------------------------------------------
 static unsigned long long cpu_process_chunks_multithreaded(
     const std::vector<size_t>& cpu_chunk_ids,
@@ -783,12 +776,6 @@ static unsigned long long cpu_process_chunks_multithreaded(
         total_sum += v;
     }
 
-    /*
-       The CPU workers run in parallel, so summing all worker times would
-       over-report the wall-clock cost. For stage columns, use the slowest
-       worker's decompression/query time as a critical-path estimate.
-       CPU_Total_ms remains the main wall-clock CPU-side value.
-    */
     cpu_decomp_ms =
         *std::max_element(
             worker_decomp_ms.begin(),
@@ -1182,11 +1169,11 @@ int main() {
                   << std::setw(14) << "DIFF ms"
                   << std::setw(14) << "TOTAL ms"
                   << std::setw(14) << "EFF GiB/s"
-                  << std::setw(12) << "MATCH?"
+                  << std::setw(12) << "QUERY RESULT MATCH?"
                   << "\n";
 
         std::cout
-            << "------------------------------------------------------------------------------------------------------------------------------------------------\n";
+            << "----------------------------------------------------------------------------------------------------------------------------------------------------------\n";
 
         std::vector<int> summary_cpu_percent;
         std::vector<int> summary_gpu_percent;
