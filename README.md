@@ -68,7 +68,8 @@ Important project folders and files:
 │   │   ├── spja_dpf_fused_x40.cu
 │   │   └── spja_dpf_fused_x40_strings.cu
 │   └── tools/
-│       └── generate_customer_mktsegment_code.py
+│       ├── generate_customer_mktsegment_code.py
+│       └── compress_tbl_lz4.cpp
 │
 ├── external/
 │   └── baseline/
@@ -79,7 +80,6 @@ Important project folders and files:
 │
 ├── scripts/
 │   ├── tpch_columnar/
-│   │   ├── convert_dbgen_tbl_to_bin.py
 │   │   ├── generate_tpch_columnar.py
 │   │   ├── check_columnar_lz4_ratio.cpp
 │   │   └── check_columnar_lz4_delta_ratio.cpp
