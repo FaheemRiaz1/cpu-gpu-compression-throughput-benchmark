@@ -393,8 +393,8 @@ int main()
         "sorted_sf10_quantity_repeated_23x_5gib";
 
     const std::string quantity_path =
-        "data/baseline_quantity_sf10_sorted_lz4best_repeated/"
-        "quantity_sf10_sorted_lz4best_repeated_23x_5gib.bin";
+        "data/baseline_quantity_sf10_sorted_lz4best_repeated/" 
+        "quantity_sf10_sorted_lz4best_repeated_23x_5gib.bin"; //update this path later
 
     // Saved FastLanes output for the same 23x sorted dataset.
     const std::string fastlanes_5gib_benchmark_path =

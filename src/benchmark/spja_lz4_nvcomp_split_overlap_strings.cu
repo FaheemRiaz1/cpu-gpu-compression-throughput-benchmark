@@ -31,19 +31,19 @@ const std::string RESET = "\033[0m";
 // Main CSV filename is intentionally kept unchanged.
 // ------------------------------------------------------------
 const std::string MAIN_CSV_PATH =
-    "results/spja_workload/csv/spja_lz4_nvcomp_hybrid_split_overlap_results.csv";
+    "results/spja_workload/csv/spja_lz4_nvcomp_hybrid_split_overlap_strings_results.csv";
 
 const std::string DETAILED_CSV_PATH =
-    "results/spja_workload/csv/spja_lz4_nvcomp_hybrid_split_overlap_detailed_trials.csv";
+    "results/spja_workload/csv/spja_lz4_nvcomp_hybrid_split_overlap_strings_detailed_trials.csv";
 
 const std::string COMPRESSION_CSV_PATH =
-    "results/spja_workload/csv/spja_lz4_nvcomp_compression_stats.csv";
+    "results/spja_workload/csv/spja_lz4_nvcomp_strings_compression_stats.csv";
 
 const std::string METADATA_PATH =
-    "results/spja_workload/csv/spja_lz4_nvcomp_benchmark_metadata.txt";
+    "results/spja_workload/csv/spja_lz4_nvcomp_strings_benchmark_metadata.txt";
 
 const std::string SUMMARY_PATH =
-    "results/spja_workload/csv/spja_lz4_nvcomp_summary.txt";
+    "results/spja_workload/csv/spja_lz4_nvcomp_strings_summary.txt";
 
 // ------------------------------------------------------------
 // Basic error checking helpers
@@ -164,11 +164,11 @@ static unsigned long long spja_cpu_columnar(
     const int* quantity,
     const int* extendedprice,
     const int* order_custkey,
-    const int* customer_nation,
+    const int* customer_mktsegment_code,
     size_t n_rows,
     int order_count,
     int customer_count,
-    int target_nation
+    int target_segment
 ) {
     unsigned long long sum = 0ULL;
 
@@ -185,9 +185,9 @@ static unsigned long long spja_cpu_columnar(
             continue;
         }
 
-        const int nation = customer_nation[custkey];
+        const int segment = customer_mktsegment_code[custkey];
 
-        if (quantity[i] > 25 && nation == target_nation) {
+        if (quantity[i] > 25 && segment == target_segment) {
             sum += static_cast<unsigned long long>(extendedprice[i]);
         }
     }
@@ -202,11 +202,11 @@ __global__ void spja_gpu_columnar_kernel(
     const int* quantity,
     const int* extendedprice,
     const int* order_custkey,
-    const int* customer_nation,
+    const int* customer_mktsegment_code,
     size_t n_rows,
     int order_count,
     int customer_count,
-    int target_nation,
+    int target_segment,
     unsigned long long* block_sums
 ) {
     extern __shared__ unsigned long long shared_sum[];
@@ -223,9 +223,9 @@ __global__ void spja_gpu_columnar_kernel(
             const int custkey = order_custkey[ok];
 
             if (custkey > 0 && custkey < customer_count) {
-                const int nation = customer_nation[custkey];
+                const int segment = customer_mktsegment_code[custkey];
 
-                if (quantity[i] > 25 && nation == target_nation) {
+                if (quantity[i] > 25 && segment == target_segment) {
                     local_sum =
                         static_cast<unsigned long long>(extendedprice[i]);
                 }
@@ -623,12 +623,12 @@ static unsigned long long cpu_process_chunks_multithreaded(
     const CompressedColumn& comp_quantity,
     const CompressedColumn& comp_extendedprice,
     const std::vector<int>& host_order_custkey,
-    const std::vector<int>& host_customer_nation,
+    const std::vector<int>& host_customer_mktsegment_code,
     size_t n_rows,
     size_t chunk_rows,
     int order_count,
     int customer_count,
-    int target_nation,
+    int target_segment,
     int requested_cpu_threads,
     double& cpu_decomp_ms,
     double& cpu_spja_ms,
@@ -779,11 +779,11 @@ static unsigned long long cpu_process_chunks_multithreaded(
                             local_quantity.data(),
                             local_extendedprice.data(),
                             host_order_custkey.data(),
-                            host_customer_nation.data(),
+                            host_customer_mktsegment_code.data(),
                             rows_this,
                             order_count,
                             customer_count,
-                            target_nation
+                            target_segment
                         );
 
                     auto spja_end =
@@ -869,8 +869,8 @@ int main() {
         const std::string order_custkey_path =
             "data/tpch_columnar/order_custkey_sfx40.bin";
 
-        const std::string customer_nation_path =
-            "data/tpch_columnar/customer_nation_sfx40.bin";
+        const std::string customer_mktsegment_code_path =
+            "data/tpch_columnar/customer_mktsegment_code_sfx40.bin";
 
         const std::string part_category_path =
             "data/tpch_columnar/part_category_sf1.bin";
@@ -878,9 +878,9 @@ int main() {
         const std::string part_factor_path =
             "data/tpch_columnar/part_factor_sf1.bin";
 
-        const size_t chunk_bytes = 1ULL << 20;   // 512 KiB chunks for official SF=1
+        const size_t chunk_bytes = 1ULL << 19;   // 512 KiB chunks for official SF=1
         const size_t chunk_rows = chunk_bytes / sizeof(int);
-        const size_t gpu_batch_chunks = 768 ;      // one GPU batch for SF=1-sized input
+        const size_t gpu_batch_chunks = 1250 ;      // one GPU batch for SF=1-sized input
 
         const int lz4_hc_level = 8;
         const int warmup = 5;
@@ -919,8 +919,8 @@ int main() {
         std::vector<int> host_order_custkey =
             read_int_column(order_custkey_path);
 
-        std::vector<int> host_customer_nation =
-            read_int_column(customer_nation_path);
+        std::vector<int> host_customer_mktsegment_code =
+            read_int_column(customer_mktsegment_code_path);
 
         const size_t n_rows = host_partkey.size();
 
@@ -928,9 +928,9 @@ int main() {
             static_cast<int>(host_order_custkey.size());
 
         const int customer_count =
-            static_cast<int>(host_customer_nation.size());
+            static_cast<int>(host_customer_mktsegment_code.size());
 
-        const int target_nation = 3;
+        const int target_segment = 1; // BUILDING
 
         const size_t total_chunks =
             (n_rows + chunk_rows - 1) / chunk_rows;
@@ -946,7 +946,7 @@ int main() {
 
         std::cout << std::fixed << std::setprecision(3);
 
-        std::cout << "Loaded SFX40 SPJA columnar data for fair LZ4/nvCOMP vs FastLanes comparison:\n";
+        std::cout << "Loaded SFX40 SPJA columnar data with dictionary-encoded string predicate for fair LZ4/nvCOMP comparison:\n";
         std::cout << "  Rows: " << n_rows << "\n";
         std::cout << "  Query input size MiB: " << input_mib << "\n";
         std::cout << "  Chunks per column: " << total_chunks << "\n";
@@ -957,6 +957,7 @@ int main() {
         std::cout << "  Assignment trials per split: " << assignment_trials << "\n";
         std::cout << "  CPU worker threads: " << cpu_worker_threads << "\n";
         std::cout << "  Execution mode: CPU/GPU overlap using std::thread + CUDA stream\n";
+        std::cout << "  String predicate: customer_mktsegment = BUILDING, encoded as segment_code == 1\n";
         std::cout << "  GPU path optimization: no query/codec/data change; reusable nvCOMP metadata + pinned host compressed transfer + two-stream double buffering\n";
         std::cout << "  Chunk assignment: multiple deterministic fair assignments\n\n";
 
@@ -966,11 +967,11 @@ int main() {
                 host_quantity.data(),
                 host_extendedprice.data(),
                 host_order_custkey.data(),
-                host_customer_nation.data(),
+                host_customer_mktsegment_code.data(),
                 n_rows,
                 order_count,
                 customer_count,
-                target_nation
+                target_segment
             );
 
         auto comp_start =
@@ -1130,7 +1131,9 @@ int main() {
         metadata << "Dataset: official tpch-dbgen SF=1\n";
         metadata << "Input format: converted .tbl files to binary int32 columns\n";
         metadata << "Columns: orderkey, quantity, extendedprice\n";
-        metadata << "Query: LINEITEM + ORDERS + CUSTOMER using orderkey -> custkey -> nation\n";
+        metadata << "Query: LINEITEM + ORDERS + CUSTOMER using orderkey -> custkey -> customer_mktsegment\n";
+        metadata << "String predicate: C_MKTSEGMENT = BUILDING\n";
+        metadata << "Dictionary encoding: AUTOMOBILE=0, BUILDING=1, FURNITURE=2, MACHINERY=3, HOUSEHOLD=4\n";
         metadata << "Rows: " << n_rows << "\n";
         metadata << "Input MiB: " << input_mib << "\n";
         metadata << "Total chunks per column: " << total_chunks << "\n";
@@ -1393,7 +1396,7 @@ int main() {
                     gpu_batch_states_by_slot;
 
                 int* d_order_custkey = nullptr;
-                int* d_customer_nation = nullptr;
+                int* d_customer_mktsegment_code = nullptr;
 
                 unsigned long long* d_gpu_result = nullptr;
 
@@ -1489,7 +1492,7 @@ int main() {
                     ));
 
                     CUDA_CHECK(cudaMalloc(
-                        &d_customer_nation,
+                        &d_customer_mktsegment_code,
                         customer_count * sizeof(int)
                     ));
 
@@ -1507,8 +1510,8 @@ int main() {
                     ));
 
                     CUDA_CHECK(cudaMemcpyAsync(
-                        d_customer_nation,
-                        host_customer_nation.data(),
+                        d_customer_mktsegment_code,
+                        host_customer_mktsegment_code.data(),
                         customer_count * sizeof(int),
                         cudaMemcpyHostToDevice,
                         gpu_streams[0]
@@ -1717,12 +1720,12 @@ int main() {
                                     comp_quantity,
                                     comp_extendedprice,
                                     host_order_custkey,
-                                    host_customer_nation,
+                                    host_customer_mktsegment_code,
                                     n_rows,
                                     chunk_rows,
                                     order_count,
                                     customer_count,
-                                    target_nation,
+                                    target_segment,
                                     cpu_worker_threads,
                                     cpu_decomp_ms,
                                     cpu_spja_ms,
@@ -1800,9 +1803,6 @@ int main() {
                                 h_comp_source =
                                     static_cast<const void*>(batch.comp_flat.data());
                             } else {
-                                // Safe fallback: before reusing this slot's
-                                // pinned staging buffer, wait for any previous
-                                // async copy/work queued in the same stream.
                                 CUDA_CHECK(cudaStreamSynchronize(active_stream));
 
                                 std::memcpy(
@@ -1871,11 +1871,11 @@ int main() {
                                 d_quantity[slot],
                                 d_extendedprice[slot],
                                 d_order_custkey,
-                                d_customer_nation,
+                                d_customer_mktsegment_code,
                                 batch.rows,
                                 order_count,
                                 customer_count,
-                                target_nation,
+                                target_segment,
                                 d_block_sums[slot]
                             );
 
@@ -2182,7 +2182,7 @@ int main() {
                     }
 
                     CUDA_CHECK(cudaFree(d_order_custkey));
-                    CUDA_CHECK(cudaFree(d_customer_nation));
+                    CUDA_CHECK(cudaFree(d_customer_mktsegment_code));
                     CUDA_CHECK(cudaFree(d_gpu_result));
                 }
 
@@ -2425,5 +2425,5 @@ int main() {
     }
 }
 
-// nvcc -std=c++17 -O3   -I ~/nvcomp_env/lib/python3.12/site-packages/nvidia/libnvcomp/include   src/benchmark/spja_lz4_nvcomp_split_overlap.cu   -L ~/nvcomp_env/lib/python3.12/site-packages/nvidia/libnvcomp/lib64   -lnvcomp -llz4   -o bin/spja_lz4_nvcomp_split_overlap
-// LD_LIBRARY_PATH=~/nvcomp_env/lib/python3.12/site-packages/nvidia/libnvcomp/lib64:$LD_LIBRARY_PATH ./bin/spja_lz4_nvcomp_split_overlap
+// // // nvcc -std=c++17 -O3   -I ~/nvcomp_env/lib/python3.12/site-packages/nvidia/libnvcomp/include   src/benchmark/spja_lz4_nvcomp_split_overlap_strings.cu   -L ~/nvcomp_env/lib/python3.12/site-packages/nvidia/libnvcomp/lib64   -lnvcomp -llz4   -o bin/spja_lz4_nvcomp_split_overlap_strings
+// // // LD_LIBRARY_PATH=~/nvcomp_env/lib/python3.12/site-packages/nvidia/libnvcomp/lib64:$LD_LIBRARY_PATH ./bin/spja_lz4_nvcomp_split_overlap_strings

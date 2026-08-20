@@ -42,13 +42,6 @@ data = [
         "System": "LZ4_HC/nvCOMP LZ4",
         "Throughput_GBps": 13.904,
     },
-
-    # Later example:
-    # {
-    #     "Dataset": "224x / 5 GiB",
-    #     "System": "nvCOMP Cascaded",
-    #     "Throughput_GBps": YOUR_VALUE_HERE,
-    # },
 ]
 
 df = pd.DataFrame(data)
