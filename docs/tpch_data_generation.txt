@@ -1,0 +1,306 @@
+FILE NAME: docs/tpch_data_generation.txt
+
+============================================================
+TPC-H Data Generation and Columnar Preparation
+============================================================
+
+Description
+
+This file documents how TPC-H-derived data is prepared for
+the thesis benchmarks.
+
+TPC-H data is first generated in its standard table form.
+
+Required attributes are then extracted and converted into
+column-oriented binary files used by the CPU-GPU benchmark
+implementations.
+
+General preparation pipeline:
+
+TPC-H dbgen
+→ TPC-H Tables
+→ Required Column Extraction
+→ Columnar Binary Files
+→ Benchmark Input
+
+Large generated datasets are excluded from Git because they
+can be reproduced locally.
+
+============================================================
+TPC-H Generator Location
+============================================================
+
+The TPC-H dbgen utility used during development is located
+under:
+
+tools/tpch-dbgen/
+
+This directory is excluded from the final Git repository
+because it contains an external data-generation utility.
+
+============================================================
+Columnar Conversion Location
+============================================================
+
+TPC-H column preparation utilities are located under:
+
+scripts/tpch_columnar/
+
+Generated data is stored under:
+
+data/
+
+The data directory is ignored by Git.
+
+============================================================
+Dependencies
+============================================================
+
+1. TPC-H dbgen
+
+Used to generate the original TPC-H tables.
+
+------------------------------------------------------------
+
+2. Compiler / Build Tools
+
+Required for building helper programs where applicable.
+
+------------------------------------------------------------
+
+3. Linux Shell Environment
+
+Benchmark preparation scripts are executed from the
+repository environment.
+
+============================================================
+Data Generation
+============================================================
+
+TPC-H data is generated using the required scale factor.
+
+Different dataset sizes are used depending on the experiment.
+
+The original generated data contains complete TPC-H tables.
+
+Only the attributes required by the benchmark are converted
+into the column-oriented representation.
+
+============================================================
+Columnar Representation
+============================================================
+
+The thesis benchmarks operate primarily on individual columns
+instead of repeatedly processing complete row-oriented TPC-H
+tables.
+
+This is useful for analytical workloads because only
+query-relevant columns need to be:
+
+- loaded
+- compressed
+- transferred
+- decompressed
+- processed
+
+Generated column files are stored as binary data.
+
+Binary files are excluded from Git using:
+
+*.bin
+
+============================================================
+SPJA Workload
+============================================================
+
+The main SPJA workload uses data derived from:
+
+LINEITEM
+ORDERS
+CUSTOMER
+
+Relevant LINEITEM attributes include:
+
+orderkey
+quantity
+extendedprice
+
+Additional join information is derived from:
+
+ORDERS
+CUSTOMER
+
+The query performs operations corresponding to:
+
+Selection
+Projection
+Join
+Aggregation
+
+The filtering stage includes a quantity predicate and
+nation-related filtering.
+
+============================================================
+Dataset Scaling
+============================================================
+
+Multiple data sizes are used during evaluation.
+
+Smaller inputs are used for:
+
+- correctness testing
+- implementation validation
+- pipeline debugging
+- overhead analysis
+
+Larger inputs are used for:
+
+- throughput evaluation
+- CPU-GPU co-processing
+- compression evaluation
+- transfer analysis
+- GPU memory analysis
+
+------------------------------------------------------------
+
+SPJA x40
+
+A larger SPJA workload is produced by scaling TPC-H-derived
+column data.
+
+The x40 workload is used for the main CPU-GPU split
+experiments.
+
+It provides enough data for the CPU and GPU to execute
+substantial portions of the workload concurrently.
+
+============================================================
+LZ4 Input Preparation
+============================================================
+
+For the LZ4 + nvCOMP experiments, input columns are divided
+into independently compressed chunks.
+
+Main chunk size:
+
+512 KiB
+
+Compression algorithm:
+
+LZ4
+
+Compression level used for the primary prepared datasets:
+
+LZ4_HC level 8
+
+Each compressed chunk can be transferred and decompressed
+independently.
+
+This enables batched GPU decompression with nvCOMP.
+
+============================================================
+GPU Batch Processing
+============================================================
+
+Compressed chunks are grouped into batches before GPU
+decompression.
+
+The main thesis configuration uses a GPU batch size of:
+
+120 chunks
+
+The batched design allows multiple compressed chunks to be
+processed by nvCOMP in parallel.
+
+============================================================
+Generated Files
+============================================================
+
+Generated benchmark data is stored under:
+
+data/
+
+Large binary files are intentionally not committed.
+
+The .gitignore contains:
+
+data/
+
+*.bin
+
+This keeps the repository small while retaining the source
+code and scripts necessary to reproduce the data.
+
+============================================================
+Result Data
+============================================================
+
+Benchmark output is stored separately under:
+
+results/
+
+Selected CSV files and graphs used for the thesis are retained
+where necessary.
+
+Large intermediate outputs, generated datasets, temporary
+files, and unnecessary experimental results are excluded from
+Git.
+
+============================================================
+General Reproduction Procedure
+============================================================
+
+1. Prepare the TPC-H dbgen utility.
+
+2. Generate the required TPC-H scale factor.
+
+3. Extract the columns required by the benchmark.
+
+4. Convert the selected columns into binary columnar form.
+
+5. Prepare the required dataset size.
+
+6. Compress the data when required by the experiment.
+
+7. Run the corresponding benchmark implementation.
+
+8. Store benchmark measurements under the appropriate
+   results directory.
+
+============================================================
+Notes
+============================================================
+
+- TPC-H generated data is not stored in Git.
+
+- Binary column files can become several gigabytes in size.
+
+- Only query-relevant columns are required for each
+  experiment.
+
+- The same underlying TPC-H-derived data is used across the
+  main implementations where possible.
+
+- This improves comparability between LZ4 + nvCOMP,
+  FastLanes, and the other experimental baselines.
+
+============================================================
+Conclusion
+============================================================
+
+The data-preparation pipeline converts standard TPC-H data
+into the column-oriented format required by the thesis
+benchmarks.
+
+The approach enables:
+
+- independent column processing
+- compressed transfer experiments
+- GPU decompression
+- CPU-GPU workload splitting
+- SPJA query evaluation
+
+Generated data is excluded from the repository, while the
+scripts, benchmark implementations, documentation, and
+selected results required to understand and reproduce the
+experiments are retained.

@@ -1,11 +1,11 @@
 Benchmark summary
 =================
-CPU-only total ms: 61.7272
-CPU-only throughput GiB/s: 1.16939
-GPU-only total ms: 39.5516
-GPU-only throughput GiB/s: 1.69573
-Best split: 25% CPU / 75% GPU
-Best total ms: 36.7651
-Best throughput GiB/s: 1.82479
-Improvement vs CPU-only %: 40.4394
-Improvement vs GPU-only %: 7.04516
+CPU-only total ms: 253.49
+CPU-only throughput GiB/s: 10.5852
+GPU-only total ms: 438.624
+GPU-only throughput GiB/s: 6.11649
+Best split: 75% CPU / 25% GPU
+Best total ms: 201.244
+Best throughput GiB/s: 13.3408
+Improvement vs CPU-only %: 20.6104
+Improvement vs GPU-only %: 54.1191

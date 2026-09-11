@@ -296,7 +296,6 @@ int main() {
         		0.0,
         		(1.0 - static_cast<double>(total_comp_bytes) / static_cast<double>(total_bytes)) * 100.0
     			);
-//			(1.0 - static_cast<double>(total_comp_bytes) / static_cast<double>(total_bytes)) * 100.0;
                 // -------- device allocations --------
                 int* d_base = nullptr;
                 char* d_comp_flat = nullptr;

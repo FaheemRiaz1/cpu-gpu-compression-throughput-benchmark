@@ -1,0 +1,7 @@
+Dataset,System,Throughput_GBps
+SF1 / 22.9 MiB,FastLanes-GPU bitpacking,215.147
+SF1 / 22.9 MiB,LZ4_HC/nvCOMP LZ4,1.793
+32x / 732 MiB,FastLanes-GPU bitpacking,212.112
+32x / 732 MiB,LZ4_HC/nvCOMP LZ4,12.652
+224x / 5 GiB,FastLanes-GPU bitpacking,214.467
+224x / 5 GiB,LZ4_HC/nvCOMP LZ4,13.904
