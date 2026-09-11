@@ -403,6 +403,53 @@ static void destroy_batch_events(BatchTimingEvents& ev) {
     CUDA_CHECK(cudaEventDestroy(ev.kernel_end));
 }
 
+struct GpuBatchDeviceState {
+    size_t batch_count = 0;
+
+    void** d_comp_ptrs = nullptr;
+    void** d_decomp_ptrs = nullptr;
+
+    size_t* d_comp_sizes = nullptr;
+    size_t* d_uncomp_sizes = nullptr;
+    size_t* d_actual_uncomp_sizes = nullptr;
+
+    nvcompStatus_t* d_statuses = nullptr;
+};
+
+static void destroy_gpu_batch_device_state(GpuBatchDeviceState& st) {
+    if (st.d_comp_ptrs != nullptr) {
+        CUDA_CHECK(cudaFree(st.d_comp_ptrs));
+        st.d_comp_ptrs = nullptr;
+    }
+
+    if (st.d_decomp_ptrs != nullptr) {
+        CUDA_CHECK(cudaFree(st.d_decomp_ptrs));
+        st.d_decomp_ptrs = nullptr;
+    }
+
+    if (st.d_comp_sizes != nullptr) {
+        CUDA_CHECK(cudaFree(st.d_comp_sizes));
+        st.d_comp_sizes = nullptr;
+    }
+
+    if (st.d_uncomp_sizes != nullptr) {
+        CUDA_CHECK(cudaFree(st.d_uncomp_sizes));
+        st.d_uncomp_sizes = nullptr;
+    }
+
+    if (st.d_actual_uncomp_sizes != nullptr) {
+        CUDA_CHECK(cudaFree(st.d_actual_uncomp_sizes));
+        st.d_actual_uncomp_sizes = nullptr;
+    }
+
+    if (st.d_statuses != nullptr) {
+        CUDA_CHECK(cudaFree(st.d_statuses));
+        st.d_statuses = nullptr;
+    }
+
+    st.batch_count = 0;
+}
+
 // ------------------------------------------------------------
 // Build a GPU batch from an explicit list of chunk IDs.
 // This supports fair deterministic chunk assignments.
@@ -566,6 +613,237 @@ static void build_fair_chunk_assignment(
     std::sort(gpu_chunk_ids.begin(), gpu_chunk_ids.end());
 }
 
+
+// ------------------------------------------------------------
+// Multi-threaded CPU processing for CPU-owned chunks.
+// ------------------------------------------------------------
+static unsigned long long cpu_process_chunks_multithreaded(
+    const std::vector<size_t>& cpu_chunk_ids,
+    const CompressedColumn& comp_partkey,
+    const CompressedColumn& comp_quantity,
+    const CompressedColumn& comp_extendedprice,
+    const std::vector<int>& host_order_custkey,
+    const std::vector<int>& host_customer_nation,
+    size_t n_rows,
+    size_t chunk_rows,
+    int order_count,
+    int customer_count,
+    int target_nation,
+    int requested_cpu_threads,
+    double& cpu_decomp_ms,
+    double& cpu_spja_ms,
+    double& cpu_total_ms
+) {
+    auto cpu_total_start =
+        std::chrono::high_resolution_clock::now();
+
+    cpu_decomp_ms = 0.0;
+    cpu_spja_ms = 0.0;
+    cpu_total_ms = 0.0;
+
+    if (cpu_chunk_ids.empty()) {
+        return 0ULL;
+    }
+
+    const int actual_threads =
+        std::max(
+            1,
+            std::min(
+                requested_cpu_threads,
+                static_cast<int>(cpu_chunk_ids.size())
+            )
+        );
+
+    std::vector<unsigned long long> partial_sums(
+        static_cast<size_t>(actual_threads),
+        0ULL
+    );
+
+    std::vector<double> worker_decomp_ms(
+        static_cast<size_t>(actual_threads),
+        0.0
+    );
+
+    std::vector<double> worker_spja_ms(
+        static_cast<size_t>(actual_threads),
+        0.0
+    );
+
+    std::vector<std::exception_ptr> worker_exceptions(
+        static_cast<size_t>(actual_threads),
+        nullptr
+    );
+
+    std::vector<std::thread> workers;
+    workers.reserve(static_cast<size_t>(actual_threads));
+
+    const size_t chunks_per_thread =
+        (cpu_chunk_ids.size() +
+         static_cast<size_t>(actual_threads) - 1) /
+        static_cast<size_t>(actual_threads);
+
+    for (int t = 0; t < actual_threads; ++t) {
+        workers.emplace_back([&, t]() {
+            try {
+                const size_t begin =
+                    static_cast<size_t>(t) * chunks_per_thread;
+
+                const size_t end =
+                    std::min(
+                        begin + chunks_per_thread,
+                        cpu_chunk_ids.size()
+                    );
+
+                if (begin >= end) {
+                    return;
+                }
+
+                std::vector<int> local_partkey;
+                std::vector<int> local_quantity;
+                std::vector<int> local_extendedprice;
+
+                unsigned long long local_sum = 0ULL;
+                double local_decomp_ms = 0.0;
+                double local_spja_ms = 0.0;
+
+                for (size_t idx = begin; idx < end; ++idx) {
+                    const size_t c = cpu_chunk_ids[idx];
+
+                    const size_t global_start =
+                        c * chunk_rows;
+
+                    const size_t rows_this =
+                        std::min(chunk_rows, n_rows - global_start);
+
+                    const int expected_bytes =
+                        static_cast<int>(rows_this * sizeof(int));
+
+                    local_partkey.resize(rows_this);
+                    local_quantity.resize(rows_this);
+                    local_extendedprice.resize(rows_this);
+
+                    auto decomp_start =
+                        std::chrono::high_resolution_clock::now();
+
+                    const int partkey_decompressed =
+                        LZ4_decompress_safe(
+                            comp_partkey.comp_chunks[c].data(),
+                            reinterpret_cast<char*>(local_partkey.data()),
+                            static_cast<int>(comp_partkey.comp_sizes[c]),
+                            expected_bytes
+                        );
+
+                    if (partkey_decompressed != expected_bytes) {
+                        throw std::runtime_error(
+                            "CPU LZ4 orderkey decompression failed."
+                        );
+                    }
+
+                    const int quantity_decompressed =
+                        LZ4_decompress_safe(
+                            comp_quantity.comp_chunks[c].data(),
+                            reinterpret_cast<char*>(local_quantity.data()),
+                            static_cast<int>(comp_quantity.comp_sizes[c]),
+                            expected_bytes
+                        );
+
+                    if (quantity_decompressed != expected_bytes) {
+                        throw std::runtime_error(
+                            "CPU LZ4 quantity decompression failed."
+                        );
+                    }
+
+                    const int extendedprice_decompressed =
+                        LZ4_decompress_safe(
+                            comp_extendedprice.comp_chunks[c].data(),
+                            reinterpret_cast<char*>(local_extendedprice.data()),
+                            static_cast<int>(comp_extendedprice.comp_sizes[c]),
+                            expected_bytes
+                        );
+
+                    if (extendedprice_decompressed != expected_bytes) {
+                        throw std::runtime_error(
+                            "CPU LZ4 extendedprice decompression failed."
+                        );
+                    }
+
+                    auto decomp_end =
+                        std::chrono::high_resolution_clock::now();
+
+                    auto spja_start =
+                        std::chrono::high_resolution_clock::now();
+
+                    local_sum +=
+                        spja_cpu_columnar(
+                            local_partkey.data(),
+                            local_quantity.data(),
+                            local_extendedprice.data(),
+                            host_order_custkey.data(),
+                            host_customer_nation.data(),
+                            rows_this,
+                            order_count,
+                            customer_count,
+                            target_nation
+                        );
+
+                    auto spja_end =
+                        std::chrono::high_resolution_clock::now();
+
+                    local_decomp_ms +=
+                        ms_between(decomp_start, decomp_end);
+
+                    local_spja_ms +=
+                        ms_between(spja_start, spja_end);
+                }
+
+                partial_sums[static_cast<size_t>(t)] = local_sum;
+                worker_decomp_ms[static_cast<size_t>(t)] = local_decomp_ms;
+                worker_spja_ms[static_cast<size_t>(t)] = local_spja_ms;
+            }
+            catch (...) {
+                worker_exceptions[static_cast<size_t>(t)] =
+                    std::current_exception();
+            }
+        });
+    }
+
+    for (auto& worker : workers) {
+        worker.join();
+    }
+
+    for (const auto& ex : worker_exceptions) {
+        if (ex) {
+            std::rethrow_exception(ex);
+        }
+    }
+
+    unsigned long long total_sum = 0ULL;
+
+    for (unsigned long long v : partial_sums) {
+        total_sum += v;
+    }
+
+    cpu_decomp_ms =
+        *std::max_element(
+            worker_decomp_ms.begin(),
+            worker_decomp_ms.end()
+        );
+
+    cpu_spja_ms =
+        *std::max_element(
+            worker_spja_ms.begin(),
+            worker_spja_ms.end()
+        );
+
+    auto cpu_total_end =
+        std::chrono::high_resolution_clock::now();
+
+    cpu_total_ms =
+        ms_between(cpu_total_start, cpu_total_end);
+
+    return total_sum;
+}
+
 // ------------------------------------------------------------
 // Main benchmark
 // ------------------------------------------------------------
@@ -580,19 +858,19 @@ int main() {
             "data/tpch_columnar/partkey_sf1.bin";
 
         const std::string quantity_path =
-            "data/tpch_columnar/quantity_sf1.bin";
+            "data/tpch_columnar/quantity_sfx40.bin";
 
         const std::string extendedprice_path =
-            "data/tpch_columnar/extendedprice_sf1.bin";
+            "data/tpch_columnar/extendedprice_sfx40.bin";
 
         const std::string orderkey_path =
-            "data/tpch_columnar/orderkey_sf1.bin";
+            "data/tpch_columnar/orderkey_sfx40.bin";
 
         const std::string order_custkey_path =
-            "data/tpch_columnar/order_custkey_sf1.bin";
+            "data/tpch_columnar/order_custkey_sfx40.bin";
 
         const std::string customer_nation_path =
-            "data/tpch_columnar/customer_nation_sf1.bin";
+            "data/tpch_columnar/customer_nation_sfx40.bin";
 
         const std::string part_category_path =
             "data/tpch_columnar/part_category_sf1.bin";
@@ -600,14 +878,22 @@ int main() {
         const std::string part_factor_path =
             "data/tpch_columnar/part_factor_sf1.bin";
 
-        const size_t chunk_bytes = 1ULL << 19;   // 512 KiB chunks for official SF=1
+        const size_t chunk_bytes = 1ULL << 20;   // 512 KiB chunks for official SF=1
         const size_t chunk_rows = chunk_bytes / sizeof(int);
-        const size_t gpu_batch_chunks = 86;      // one GPU batch for SF=1-sized input
+        const size_t gpu_batch_chunks = 768 ;      // one GPU batch for SF=1-sized input
 
         const int lz4_hc_level = 8;
         const int warmup = 5;
-        const int iterations = 20;
+        const int iterations = 5;
         const int assignment_trials = 5;
+
+        const unsigned int detected_cpu_threads =
+            std::thread::hardware_concurrency();
+
+        const int cpu_worker_threads =
+            (detected_cpu_threads > 0)
+                ? static_cast<int>(std::min(36u, detected_cpu_threads))
+                : 36;
 
         const bool detailed_gpu_stage_timing = true;
 
@@ -660,7 +946,7 @@ int main() {
 
         std::cout << std::fixed << std::setprecision(3);
 
-        std::cout << "Loaded official tpch-dbgen SF=1 columnar data:\n";
+        std::cout << "Loaded SFX40 SPJA columnar data for fair LZ4/nvCOMP vs FastLanes comparison:\n";
         std::cout << "  Rows: " << n_rows << "\n";
         std::cout << "  Query input size MiB: " << input_mib << "\n";
         std::cout << "  Chunks per column: " << total_chunks << "\n";
@@ -669,7 +955,9 @@ int main() {
         std::cout << "  Warmup runs per assignment: " << warmup << "\n";
         std::cout << "  Timed runs per assignment: " << iterations << "\n";
         std::cout << "  Assignment trials per split: " << assignment_trials << "\n";
+        std::cout << "  CPU worker threads: " << cpu_worker_threads << "\n";
         std::cout << "  Execution mode: CPU/GPU overlap using std::thread + CUDA stream\n";
+        std::cout << "  GPU path optimization: no query/codec/data change; reusable nvCOMP metadata + pinned host compressed transfer + two-stream double buffering\n";
         std::cout << "  Chunk assignment: multiple deterministic fair assignments\n\n";
 
         const unsigned long long reference_result =
@@ -852,6 +1140,7 @@ int main() {
         metadata << "Compression: LZ4_HC level " << lz4_hc_level << "\n";
         metadata << "GPU decompression: nvCOMP LZ4\n";
         metadata << "Execution: CPU/GPU overlap using std::thread + CUDA stream\n";
+        metadata << "GPU path optimization: no query/codec/data change; reusable nvCOMP metadata + pinned host compressed transfer + two-stream double buffering\n";
         metadata << "Assignment trials per split: " << assignment_trials << "\n";
         metadata << "Warmup runs per assignment: " << warmup << "\n";
         metadata << "Timed runs per assignment: " << iterations << "\n";
@@ -929,11 +1218,11 @@ int main() {
                   << std::setw(14) << "DIFF ms"
                   << std::setw(14) << "TOTAL ms"
                   << std::setw(14) << "EFF GiB/s"
-                  << std::setw(12) << "MATCH?"
+                  << std::setw(12) << "QUERY RESULT MATCH?"
                   << "\n";
 
         std::cout
-            << "------------------------------------------------------------------------------------------------------------------------------------------------\n";
+            << "----------------------------------------------------------------------------------------------------------------------------------------------------------\n";
 
         std::vector<int> summary_cpu_percent;
         std::vector<int> summary_gpu_percent;
@@ -1049,93 +1338,150 @@ int main() {
                         std::max(max_batch_count, batch.comp_sizes.size());
                 }
 
-                std::vector<int> cpu_partkey(cpu_rows);
-                std::vector<int> cpu_quantity(cpu_rows);
-                std::vector<int> cpu_extendedprice(cpu_rows);
+                const int gpu_buffer_slots = 2;
 
-                cudaStream_t stream;
-                CUDA_CHECK(cudaStreamCreate(&stream));
+                cudaStream_t gpu_streams[gpu_buffer_slots] = {
+                    nullptr,
+                    nullptr
+                };
 
-                char* h_pinned_comp = nullptr;
+                CUDA_CHECK(cudaStreamCreate(&gpu_streams[0]));
+                CUDA_CHECK(cudaStreamCreate(&gpu_streams[1]));
 
-                char* d_comp_flat = nullptr;
-                int* d_partkey = nullptr;
-                int* d_quantity = nullptr;
-                int* d_extendedprice = nullptr;
+                // Fallback pinned staging buffer. It is used only if direct
+                // cudaHostRegister() of the already-built compressed batches
+                // is not available on this system.
+                char* h_pinned_comp[gpu_buffer_slots] = {
+                    nullptr,
+                    nullptr
+                };
 
-                void** d_comp_ptrs = nullptr;
-                void** d_decomp_ptrs = nullptr;
+                bool use_registered_batch_host_memory = false;
+                std::vector<void*> registered_host_buffers;
 
-                size_t* d_comp_sizes = nullptr;
-                size_t* d_uncomp_sizes = nullptr;
-                size_t* d_actual_uncomp_sizes = nullptr;
+                char* d_comp_flat[gpu_buffer_slots] = {
+                    nullptr,
+                    nullptr
+                };
 
-                nvcompStatus_t* d_statuses = nullptr;
-                void* d_temp = nullptr;
+                int* d_partkey[gpu_buffer_slots] = {
+                    nullptr,
+                    nullptr
+                };
+
+                int* d_quantity[gpu_buffer_slots] = {
+                    nullptr,
+                    nullptr
+                };
+
+                int* d_extendedprice[gpu_buffer_slots] = {
+                    nullptr,
+                    nullptr
+                };
+
+                void* d_temp[gpu_buffer_slots] = {
+                    nullptr,
+                    nullptr
+                };
+
+                unsigned long long* d_block_sums[gpu_buffer_slots] = {
+                    nullptr,
+                    nullptr
+                };
+
+                std::vector<std::vector<GpuBatchDeviceState>>
+                    gpu_batch_states_by_slot;
 
                 int* d_order_custkey = nullptr;
                 int* d_customer_nation = nullptr;
 
                 unsigned long long* d_gpu_result = nullptr;
-                unsigned long long* d_block_sums = nullptr;
 
                 size_t temp_bytes = 0;
 
                 if (!gpu_chunk_ids.empty()) {
-                    CUDA_CHECK(cudaMallocHost(
-                        &h_pinned_comp,
-                        max_batch_comp_bytes
-                    ));
+                    // Try to pin the existing compressed batch buffers directly.
+                    // This removes the extra host memcpy from std::vector ->
+                    // pinned staging memory in the timed loop, while keeping the
+                    // exact same H2D compressed transfer in the benchmark path.
+                    use_registered_batch_host_memory = true;
+                    registered_host_buffers.reserve(gpu_batches.size());
 
-                    CUDA_CHECK(cudaMalloc(
-                        &d_comp_flat,
-                        max_batch_comp_bytes
-                    ));
+                    for (auto& batch : gpu_batches) {
+                        if (batch.comp_bytes == 0) {
+                            continue;
+                        }
 
-                    CUDA_CHECK(cudaMalloc(
-                        &d_partkey,
-                        max_batch_rows * sizeof(int)
-                    ));
+                        cudaError_t reg_status = cudaHostRegister(
+                            batch.comp_flat.data(),
+                            batch.comp_bytes,
+                            cudaHostRegisterDefault
+                        );
 
-                    CUDA_CHECK(cudaMalloc(
-                        &d_quantity,
-                        max_batch_rows * sizeof(int)
-                    ));
+                        if (reg_status != cudaSuccess) {
+                            std::cerr
+                                << "Warning: cudaHostRegister failed for compressed batch memory ("
+                                << cudaGetErrorString(reg_status)
+                                << "). Falling back to pinned staging buffers.\n";
 
-                    CUDA_CHECK(cudaMalloc(
-                        &d_extendedprice,
-                        max_batch_rows * sizeof(int)
-                    ));
+                            // Clear any pending runtime error state before continuing.
+                            cudaGetLastError();
+                            use_registered_batch_host_memory = false;
+                            break;
+                        }
 
-                    CUDA_CHECK(cudaMalloc(
-                        &d_comp_ptrs,
-                        max_batch_count * sizeof(void*)
-                    ));
+                        registered_host_buffers.push_back(
+                            static_cast<void*>(batch.comp_flat.data())
+                        );
+                    }
 
-                    CUDA_CHECK(cudaMalloc(
-                        &d_decomp_ptrs,
-                        max_batch_count * sizeof(void*)
-                    ));
+                    if (!use_registered_batch_host_memory) {
+                        for (void* ptr : registered_host_buffers) {
+                            CUDA_CHECK(cudaHostUnregister(ptr));
+                        }
 
-                    CUDA_CHECK(cudaMalloc(
-                        &d_comp_sizes,
-                        max_batch_count * sizeof(size_t)
-                    ));
+                        registered_host_buffers.clear();
 
-                    CUDA_CHECK(cudaMalloc(
-                        &d_uncomp_sizes,
-                        max_batch_count * sizeof(size_t)
-                    ));
+                        for (int slot = 0; slot < gpu_buffer_slots; ++slot) {
+                            CUDA_CHECK(cudaMallocHost(
+                                &h_pinned_comp[slot],
+                                max_batch_comp_bytes
+                            ));
+                        }
+                    }
 
-                    CUDA_CHECK(cudaMalloc(
-                        &d_actual_uncomp_sizes,
-                        max_batch_count * sizeof(size_t)
-                    ));
+                    for (int slot = 0; slot < gpu_buffer_slots; ++slot) {
+                        CUDA_CHECK(cudaMalloc(
+                            &d_comp_flat[slot],
+                            max_batch_comp_bytes
+                        ));
 
-                    CUDA_CHECK(cudaMalloc(
-                        &d_statuses,
-                        max_batch_count * sizeof(nvcompStatus_t)
-                    ));
+                        CUDA_CHECK(cudaMalloc(
+                            &d_partkey[slot],
+                            max_batch_rows * sizeof(int)
+                        ));
+
+                        CUDA_CHECK(cudaMalloc(
+                            &d_quantity[slot],
+                            max_batch_rows * sizeof(int)
+                        ));
+
+                        CUDA_CHECK(cudaMalloc(
+                            &d_extendedprice[slot],
+                            max_batch_rows * sizeof(int)
+                        ));
+
+                        const int block_size_for_alloc = 256;
+
+                        const size_t max_spja_blocks =
+                            (max_batch_rows + block_size_for_alloc - 1) /
+                            block_size_for_alloc;
+
+                        CUDA_CHECK(cudaMalloc(
+                            &d_block_sums[slot],
+                            max_spja_blocks * sizeof(unsigned long long)
+                        ));
+                    }
 
                     CUDA_CHECK(cudaMalloc(
                         &d_order_custkey,
@@ -1147,21 +1493,9 @@ int main() {
                         customer_count * sizeof(int)
                     ));
 
-
                     CUDA_CHECK(cudaMalloc(
                         &d_gpu_result,
                         sizeof(unsigned long long)
-                    ));
-
-                    const int block_size_for_alloc = 256;
-
-                    const size_t max_spja_blocks =
-                        (max_batch_rows + block_size_for_alloc - 1) /
-                        block_size_for_alloc;
-
-                    CUDA_CHECK(cudaMalloc(
-                        &d_block_sums,
-                        max_spja_blocks * sizeof(unsigned long long)
                     ));
 
                     CUDA_CHECK(cudaMemcpyAsync(
@@ -1169,7 +1503,7 @@ int main() {
                         host_order_custkey.data(),
                         order_count * sizeof(int),
                         cudaMemcpyHostToDevice,
-                        stream
+                        gpu_streams[0]
                     ));
 
                     CUDA_CHECK(cudaMemcpyAsync(
@@ -1177,92 +1511,146 @@ int main() {
                         host_customer_nation.data(),
                         customer_count * sizeof(int),
                         cudaMemcpyHostToDevice,
-                        stream
+                        gpu_streams[0]
                     ));
 
-                    CUDA_CHECK(cudaStreamSynchronize(stream));
+                    CUDA_CHECK(cudaStreamSynchronize(gpu_streams[0]));
 
                     const nvcompBatchedLZ4DecompressOpts_t opts =
                         nvcompBatchedLZ4DecompressDefaultOpts;
 
-                    for (const auto& batch : gpu_batches) {
-                        const size_t batch_count =
-                            batch.comp_sizes.size();
+                    gpu_batch_states_by_slot.resize(
+                        static_cast<size_t>(gpu_buffer_slots)
+                    );
 
-                        std::vector<void*> host_d_comp_ptrs(batch_count);
-                        std::vector<void*> host_d_decomp_ptrs(batch_count);
-
-                        for (size_t k = 0; k < batch_count; ++k) {
-                            host_d_comp_ptrs[k] =
-                                d_comp_flat + batch.comp_offsets[k];
-
-                            const size_t row_offset =
-                                batch.row_offsets[k];
-
-                            const int col =
-                                batch.column_ids[k];
-
-                            if (col == 0) {
-                                host_d_decomp_ptrs[k] =
-                                    d_partkey + row_offset;
-                            } else if (col == 1) {
-                                host_d_decomp_ptrs[k] =
-                                    d_quantity + row_offset;
-                            } else {
-                                host_d_decomp_ptrs[k] =
-                                    d_extendedprice + row_offset;
-                            }
-                        }
-
-                        CUDA_CHECK(cudaMemcpy(
-                            d_comp_ptrs,
-                            host_d_comp_ptrs.data(),
-                            batch_count * sizeof(void*),
-                            cudaMemcpyHostToDevice
-                        ));
-
-                        CUDA_CHECK(cudaMemcpy(
-                            d_decomp_ptrs,
-                            host_d_decomp_ptrs.data(),
-                            batch_count * sizeof(void*),
-                            cudaMemcpyHostToDevice
-                        ));
-
-                        CUDA_CHECK(cudaMemcpy(
-                            d_comp_sizes,
-                            batch.comp_sizes.data(),
-                            batch_count * sizeof(size_t),
-                            cudaMemcpyHostToDevice
-                        ));
-
-                        CUDA_CHECK(cudaMemcpy(
-                            d_uncomp_sizes,
-                            batch.uncomp_sizes.data(),
-                            batch_count * sizeof(size_t),
-                            cudaMemcpyHostToDevice
-                        ));
-
-                        size_t temp_candidate = 0;
-
-                        NVCOMP_CHECK(
-                            nvcompBatchedLZ4DecompressGetTempSizeSync(
-                                (const void* const* const)d_comp_ptrs,
-                                d_comp_sizes,
-                                batch_count,
-                                chunk_bytes,
-                                &temp_candidate,
-                                batch.rows * sizeof(int) * 3,
-                                opts,
-                                d_statuses,
-                                stream
-                            )
+                    for (int slot = 0; slot < gpu_buffer_slots; ++slot) {
+                        gpu_batch_states_by_slot[static_cast<size_t>(slot)].resize(
+                            gpu_batches.size()
                         );
 
-                        temp_bytes =
-                            std::max(temp_bytes, temp_candidate);
+                        for (size_t b = 0; b < gpu_batches.size(); ++b) {
+                            const auto& batch = gpu_batches[b];
+
+                            GpuBatchDeviceState& state =
+                                gpu_batch_states_by_slot
+                                    [static_cast<size_t>(slot)][b];
+
+                            state.batch_count = batch.comp_sizes.size();
+
+                            CUDA_CHECK(cudaMalloc(
+                                &state.d_comp_ptrs,
+                                state.batch_count * sizeof(void*)
+                            ));
+
+                            CUDA_CHECK(cudaMalloc(
+                                &state.d_decomp_ptrs,
+                                state.batch_count * sizeof(void*)
+                            ));
+
+                            CUDA_CHECK(cudaMalloc(
+                                &state.d_comp_sizes,
+                                state.batch_count * sizeof(size_t)
+                            ));
+
+                            CUDA_CHECK(cudaMalloc(
+                                &state.d_uncomp_sizes,
+                                state.batch_count * sizeof(size_t)
+                            ));
+
+                            CUDA_CHECK(cudaMalloc(
+                                &state.d_actual_uncomp_sizes,
+                                state.batch_count * sizeof(size_t)
+                            ));
+
+                            CUDA_CHECK(cudaMalloc(
+                                &state.d_statuses,
+                                state.batch_count * sizeof(nvcompStatus_t)
+                            ));
+
+                            std::vector<void*> host_d_comp_ptrs(
+                                state.batch_count
+                            );
+
+                            std::vector<void*> host_d_decomp_ptrs(
+                                state.batch_count
+                            );
+
+                            for (size_t k = 0; k < state.batch_count; ++k) {
+                                host_d_comp_ptrs[k] =
+                                    d_comp_flat[slot] + batch.comp_offsets[k];
+
+                                const size_t row_offset =
+                                    batch.row_offsets[k];
+
+                                const int col =
+                                    batch.column_ids[k];
+
+                                if (col == 0) {
+                                    host_d_decomp_ptrs[k] =
+                                        d_partkey[slot] + row_offset;
+                                } else if (col == 1) {
+                                    host_d_decomp_ptrs[k] =
+                                        d_quantity[slot] + row_offset;
+                                } else {
+                                    host_d_decomp_ptrs[k] =
+                                        d_extendedprice[slot] + row_offset;
+                                }
+                            }
+
+                            CUDA_CHECK(cudaMemcpy(
+                                state.d_comp_ptrs,
+                                host_d_comp_ptrs.data(),
+                                state.batch_count * sizeof(void*),
+                                cudaMemcpyHostToDevice
+                            ));
+
+                            CUDA_CHECK(cudaMemcpy(
+                                state.d_decomp_ptrs,
+                                host_d_decomp_ptrs.data(),
+                                state.batch_count * sizeof(void*),
+                                cudaMemcpyHostToDevice
+                            ));
+
+                            CUDA_CHECK(cudaMemcpy(
+                                state.d_comp_sizes,
+                                batch.comp_sizes.data(),
+                                state.batch_count * sizeof(size_t),
+                                cudaMemcpyHostToDevice
+                            ));
+
+                            CUDA_CHECK(cudaMemcpy(
+                                state.d_uncomp_sizes,
+                                batch.uncomp_sizes.data(),
+                                state.batch_count * sizeof(size_t),
+                                cudaMemcpyHostToDevice
+                            ));
+
+                            if (slot == 0) {
+                                size_t temp_candidate = 0;
+
+                                NVCOMP_CHECK(
+                                    nvcompBatchedLZ4DecompressGetTempSizeSync(
+                                        (const void* const* const)state.d_comp_ptrs,
+                                        state.d_comp_sizes,
+                                        state.batch_count,
+                                        chunk_bytes,
+                                        &temp_candidate,
+                                        batch.rows * sizeof(int) * 3,
+                                        opts,
+                                        state.d_statuses,
+                                        gpu_streams[0]
+                                    )
+                                );
+
+                                temp_bytes =
+                                    std::max(temp_bytes, temp_candidate);
+                            }
+                        }
                     }
 
-                    CUDA_CHECK(cudaMalloc(&d_temp, temp_bytes));
+                    for (int slot = 0; slot < gpu_buffer_slots; ++slot) {
+                        CUDA_CHECK(cudaMalloc(&d_temp[slot], temp_bytes));
+                    }
                 }
 
                 std::vector<double> cpu_decomp_ms_runs;
@@ -1322,113 +1710,24 @@ int main() {
 
                     std::thread cpu_thread([&]() {
                         try {
-                            auto cpu_start =
-                                std::chrono::high_resolution_clock::now();
-
-                            auto cpu_decomp_start =
-                                std::chrono::high_resolution_clock::now();
-
-                            if (!cpu_chunk_ids.empty()) {
-                                size_t local_row_offset = 0;
-
-                                for (size_t idx = 0;
-                                     idx < cpu_chunk_ids.size();
-                                     ++idx) {
-
-                                    const size_t c = cpu_chunk_ids[idx];
-
-                                    const size_t global_start =
-                                        c * chunk_rows;
-
-                                    const size_t rows_this =
-                                        std::min(
-                                            chunk_rows,
-                                            n_rows - global_start
-                                        );
-
-                                    const int expected_bytes =
-                                        static_cast<int>(
-                                            rows_this * sizeof(int)
-                                        );
-
-                                    const CompressedColumn* cols[3] = {
-                                        &comp_partkey,
-                                        &comp_quantity,
-                                        &comp_extendedprice
-                                    };
-
-                                    int* dst_cols[3] = {
-                                        cpu_partkey.data(),
-                                        cpu_quantity.data(),
-                                        cpu_extendedprice.data()
-                                    };
-
-                                    for (int col = 0; col < 3; ++col) {
-                                        const CompressedColumn& cc =
-                                            *cols[col];
-
-                                        const int compressed_size =
-                                            static_cast<int>(
-                                                cc.comp_sizes[c]
-                                            );
-
-                                        const int decompressed_size =
-                                            LZ4_decompress_safe(
-                                                cc.comp_chunks[c].data(),
-                                                reinterpret_cast<char*>(
-                                                    dst_cols[col] +
-                                                    local_row_offset
-                                                ),
-                                                compressed_size,
-                                                expected_bytes
-                                            );
-
-                                        if (decompressed_size != expected_bytes) {
-                                            throw std::runtime_error(
-                                                "CPU LZ4 column decompression failed."
-                                            );
-                                        }
-                                    }
-
-                                    local_row_offset += rows_this;
-                                }
-                            }
-
-                            auto cpu_decomp_end =
-                                std::chrono::high_resolution_clock::now();
-
-                            auto cpu_spja_start =
-                                std::chrono::high_resolution_clock::now();
-
-                            if (cpu_rows > 0) {
-                                    cpu_result =
-                                        spja_cpu_columnar(
-                                            cpu_partkey.data(),          // actually orderkey now
-                                            cpu_quantity.data(),
-                                            cpu_extendedprice.data(),
-                                            host_order_custkey.data(),
-                                            host_customer_nation.data(),
-                                            cpu_rows,
-                                            order_count,
-                                            customer_count,
-                                            target_nation
-                                        );
-                            }
-
-                            auto cpu_spja_end =
-                                std::chrono::high_resolution_clock::now();
-
-                            auto cpu_end =
-                                std::chrono::high_resolution_clock::now();
-
-                            cpu_decomp_ms =
-                                ms_between(cpu_decomp_start, cpu_decomp_end);
-
-                            cpu_spja_ms =
-                                ms_between(cpu_spja_start, cpu_spja_end);
-
-                            cpu_total_ms =
-                                ms_between(cpu_start, cpu_end);
+                            cpu_result =
+                                cpu_process_chunks_multithreaded(
+                                    cpu_chunk_ids,
+                                    comp_partkey,
+                                    comp_quantity,
+                                    comp_extendedprice,
+                                    host_order_custkey,
+                                    host_customer_nation,
+                                    n_rows,
+                                    chunk_rows,
+                                    order_count,
+                                    customer_count,
+                                    target_nation,
+                                    cpu_worker_threads,
+                                    cpu_decomp_ms,
+                                    cpu_spja_ms,
+                                    cpu_total_ms
+                                );
                         }
                         catch (...) {
                             cpu_exception = std::current_exception();
@@ -1443,140 +1742,114 @@ int main() {
                             d_gpu_result,
                             0,
                             sizeof(unsigned long long),
-                            stream
+                            gpu_streams[0]
                         ));
+
+                        CUDA_CHECK(cudaStreamSynchronize(gpu_streams[0]));
 
                         CUDA_CHECK(cudaEventRecord(
                             ev_gpu_start,
-                            stream
+                            gpu_streams[0]
                         ));
-                        //rewrtitng
+
+                        CUDA_CHECK(cudaStreamWaitEvent(
+                            gpu_streams[1],
+                            ev_gpu_start,
+                            0
+                        ));
+
+                        cudaEvent_t stream_done[gpu_buffer_slots] = {
+                            nullptr,
+                            nullptr
+                        };
+
+                        for (int slot = 0; slot < gpu_buffer_slots; ++slot) {
+                            CUDA_CHECK(cudaEventCreate(&stream_done[slot]));
+                        }
+
+                        // Double-buffered scheduling only: same benchmark path,
+                        // but batch b uses slot b % 2. This allows H2D of one
+                        // batch to overlap with decompression/query work already
+                        // queued in the other stream.
                         for (size_t b = 0;
                              b < gpu_batches.size();
                              ++b) {
 
+                            const int slot =
+                                static_cast<int>(b % gpu_buffer_slots);
+
+                            cudaStream_t active_stream =
+                                gpu_streams[slot];
+
                             const auto& batch = gpu_batches[b];
 
-                            const size_t batch_count =
-                                batch.comp_sizes.size();
-
-                            std::vector<void*> host_d_comp_ptrs(batch_count);
-                            std::vector<void*> host_d_decomp_ptrs(batch_count);
-
-                            for (size_t k = 0; k < batch_count; ++k) {
-                                host_d_comp_ptrs[k] =
-                                    d_comp_flat + batch.comp_offsets[k];
-
-                                const size_t row_offset =
-                                    batch.row_offsets[k];
-
-                                const int col =
-                                    batch.column_ids[k];
-
-                                if (col == 0) {
-                                    host_d_decomp_ptrs[k] =
-                                        d_partkey + row_offset;
-                                } else if (col == 1) {
-                                    host_d_decomp_ptrs[k] =
-                                        d_quantity + row_offset;
-                                } else {
-                                    host_d_decomp_ptrs[k] =
-                                        d_extendedprice + row_offset;
-                                }
-                            }
+                            const GpuBatchDeviceState& state =
+                                gpu_batch_states_by_slot
+                                    [static_cast<size_t>(slot)][b];
 
                             if (detailed_gpu_stage_timing) {
                                 CUDA_CHECK(cudaEventRecord(
                                     batch_events[b].batch_start,
-                                    stream
+                                    active_stream
                                 ));
                             }
 
-                            CUDA_CHECK(cudaMemcpyAsync(
-                                d_comp_ptrs,
-                                host_d_comp_ptrs.data(),
-                                batch_count * sizeof(void*),
-                                cudaMemcpyHostToDevice,
-                                stream
-                            ));
+                            const void* h_comp_source = nullptr;
+
+                            if (use_registered_batch_host_memory) {
+                                h_comp_source =
+                                    static_cast<const void*>(batch.comp_flat.data());
+                            } else {
+                                // Safe fallback: before reusing this slot's
+                                // pinned staging buffer, wait for any previous
+                                // async copy/work queued in the same stream.
+                                CUDA_CHECK(cudaStreamSynchronize(active_stream));
+
+                                std::memcpy(
+                                    h_pinned_comp[slot],
+                                    batch.comp_flat.data(),
+                                    batch.comp_bytes
+                                );
+
+                                h_comp_source =
+                                    static_cast<const void*>(h_pinned_comp[slot]);
+                            }
 
                             CUDA_CHECK(cudaMemcpyAsync(
-                                d_decomp_ptrs,
-                                host_d_decomp_ptrs.data(),
-                                batch_count * sizeof(void*),
-                                cudaMemcpyHostToDevice,
-                                stream
-                            ));
-
-                            CUDA_CHECK(cudaMemcpyAsync(
-                                d_comp_sizes,
-                                batch.comp_sizes.data(),
-                                batch_count * sizeof(size_t),
-                                cudaMemcpyHostToDevice,
-                                stream
-                            ));
-
-                            CUDA_CHECK(cudaMemcpyAsync(
-                                d_uncomp_sizes,
-                                batch.uncomp_sizes.data(),
-                                batch_count * sizeof(size_t),
-                                cudaMemcpyHostToDevice,
-                                stream
-                            ));
-
-                            std::memcpy(
-                                h_pinned_comp,
-                                batch.comp_flat.data(),
-                                batch.comp_bytes
-                            );
-
-                            CUDA_CHECK(cudaMemcpyAsync(
-                                d_comp_flat,
-                                h_pinned_comp,
+                                d_comp_flat[slot],
+                                h_comp_source,
                                 batch.comp_bytes,
                                 cudaMemcpyHostToDevice,
-                                stream
+                                active_stream
                             ));
-
-                            CUDA_CHECK(cudaStreamSynchronize(stream));
 
                             if (detailed_gpu_stage_timing) {
                                 CUDA_CHECK(cudaEventRecord(
                                     batch_events[b].h2d_end,
-                                    stream
+                                    active_stream
                                 ));
                             }
 
                             NVCOMP_CHECK(
-                                nvcompBatchedLZ4GetDecompressSizeAsync(
-                                    (const void* const*)d_comp_ptrs,
-                                    d_comp_sizes,
-                                    d_uncomp_sizes,
-                                    batch_count,
-                                    stream
-                                )
-                            );
-
-                            NVCOMP_CHECK(
                                 nvcompBatchedLZ4DecompressAsync(
-                                    (const void* const*)d_comp_ptrs,
-                                    d_comp_sizes,
-                                    d_uncomp_sizes,
-                                    d_actual_uncomp_sizes,
-                                    batch_count,
-                                    d_temp,
+                                    (const void* const*)state.d_comp_ptrs,
+                                    state.d_comp_sizes,
+                                    state.d_uncomp_sizes,
+                                    state.d_actual_uncomp_sizes,
+                                    state.batch_count,
+                                    d_temp[slot],
                                     temp_bytes,
-                                    d_decomp_ptrs,
+                                    state.d_decomp_ptrs,
                                     opts,
-                                    d_statuses,
-                                    stream
+                                    state.d_statuses,
+                                    active_stream
                                 )
                             );
 
                             if (detailed_gpu_stage_timing) {
                                 CUDA_CHECK(cudaEventRecord(
                                     batch_events[b].decomp_end,
-                                    stream
+                                    active_stream
                                 ));
                             }
 
@@ -1588,23 +1861,23 @@ int main() {
                                     block_size
                                 );
 
-                                spja_gpu_columnar_kernel<<<
-                                    grid_size,
-                                    block_size,
-                                    block_size * sizeof(unsigned long long),
-                                    stream
-                                >>>(
-                                    d_partkey,              // actually orderkey now
-                                    d_quantity,
-                                    d_extendedprice,
-                                    d_order_custkey,
-                                    d_customer_nation,
-                                    batch.rows,
-                                    order_count,
-                                    customer_count,
-                                    target_nation,
-                                    d_block_sums
-                                );
+                            spja_gpu_columnar_kernel<<<
+                                grid_size,
+                                block_size,
+                                block_size * sizeof(unsigned long long),
+                                active_stream
+                            >>>(
+                                d_partkey[slot],              // actually orderkey now
+                                d_quantity[slot],
+                                d_extendedprice[slot],
+                                d_order_custkey,
+                                d_customer_nation,
+                                batch.rows,
+                                order_count,
+                                customer_count,
+                                target_nation,
+                                d_block_sums[slot]
+                            );
 
                             CUDA_CHECK(cudaGetLastError());
 
@@ -1619,9 +1892,9 @@ int main() {
                                 reduce_grid_size,
                                 block_size,
                                 block_size * sizeof(unsigned long long),
-                                stream
+                                active_stream
                             >>>(
-                                d_block_sums,
+                                d_block_sums[slot],
                                 static_cast<size_t>(grid_size),
                                 d_gpu_result
                             );
@@ -1631,9 +1904,24 @@ int main() {
                             if (detailed_gpu_stage_timing) {
                                 CUDA_CHECK(cudaEventRecord(
                                     batch_events[b].kernel_end,
-                                    stream
+                                    active_stream
                                 ));
                             }
+                        }
+
+                        for (int slot = 0; slot < gpu_buffer_slots; ++slot) {
+                            CUDA_CHECK(cudaEventRecord(
+                                stream_done[slot],
+                                gpu_streams[slot]
+                            ));
+                        }
+
+                        for (int slot = 0; slot < gpu_buffer_slots; ++slot) {
+                            CUDA_CHECK(cudaStreamWaitEvent(
+                                gpu_streams[0],
+                                stream_done[slot],
+                                0
+                            ));
                         }
 
                         CUDA_CHECK(cudaMemcpyAsync(
@@ -1641,17 +1929,21 @@ int main() {
                             d_gpu_result,
                             sizeof(unsigned long long),
                             cudaMemcpyDeviceToHost,
-                            stream
+                            gpu_streams[0]
                         ));
 
                         CUDA_CHECK(cudaEventRecord(
                             ev_gpu_end,
-                            stream
+                            gpu_streams[0]
                         ));
+
+                        for (int slot = 0; slot < gpu_buffer_slots; ++slot) {
+                            CUDA_CHECK(cudaEventDestroy(stream_done[slot]));
+                        }
                     }
 
                     if (!gpu_chunk_ids.empty()) {
-                        CUDA_CHECK(cudaStreamSynchronize(stream));
+                        CUDA_CHECK(cudaStreamSynchronize(gpu_streams[0]));
 
                         float f_gpu_total = 0.0f;
 
@@ -1862,25 +2154,41 @@ int main() {
                     << "\n";
 
                 if (!gpu_chunk_ids.empty()) {
-                    CUDA_CHECK(cudaFreeHost(h_pinned_comp));
-                    CUDA_CHECK(cudaFree(d_comp_flat));
-                    CUDA_CHECK(cudaFree(d_partkey));
-                    CUDA_CHECK(cudaFree(d_quantity));
-                    CUDA_CHECK(cudaFree(d_extendedprice));
-                    CUDA_CHECK(cudaFree(d_comp_ptrs));
-                    CUDA_CHECK(cudaFree(d_decomp_ptrs));
-                    CUDA_CHECK(cudaFree(d_comp_sizes));
-                    CUDA_CHECK(cudaFree(d_uncomp_sizes));
-                    CUDA_CHECK(cudaFree(d_actual_uncomp_sizes));
-                    CUDA_CHECK(cudaFree(d_statuses));
-                    CUDA_CHECK(cudaFree(d_temp));
+                    if (use_registered_batch_host_memory) {
+                        for (void* ptr : registered_host_buffers) {
+                            CUDA_CHECK(cudaHostUnregister(ptr));
+                        }
+                    } else {
+                        for (int slot = 0; slot < gpu_buffer_slots; ++slot) {
+                            if (h_pinned_comp[slot] != nullptr) {
+                                CUDA_CHECK(cudaFreeHost(h_pinned_comp[slot]));
+                            }
+                        }
+                    }
+
+                    for (auto& states_for_slot : gpu_batch_states_by_slot) {
+                        for (auto& state : states_for_slot) {
+                            destroy_gpu_batch_device_state(state);
+                        }
+                    }
+
+                    for (int slot = 0; slot < gpu_buffer_slots; ++slot) {
+                        CUDA_CHECK(cudaFree(d_comp_flat[slot]));
+                        CUDA_CHECK(cudaFree(d_partkey[slot]));
+                        CUDA_CHECK(cudaFree(d_quantity[slot]));
+                        CUDA_CHECK(cudaFree(d_extendedprice[slot]));
+                        CUDA_CHECK(cudaFree(d_temp[slot]));
+                        CUDA_CHECK(cudaFree(d_block_sums[slot]));
+                    }
+
                     CUDA_CHECK(cudaFree(d_order_custkey));
                     CUDA_CHECK(cudaFree(d_customer_nation));
                     CUDA_CHECK(cudaFree(d_gpu_result));
-                    CUDA_CHECK(cudaFree(d_block_sums));
                 }
 
-                CUDA_CHECK(cudaStreamDestroy(stream));
+                for (int slot = 0; slot < gpu_buffer_slots; ++slot) {
+                    CUDA_CHECK(cudaStreamDestroy(gpu_streams[slot]));
+                }
             }
 
             const double avg_cpu_total_ms =
@@ -2116,3 +2424,6 @@ int main() {
         return 1;
     }
 }
+
+// nvcc -std=c++17 -O3   -I ~/nvcomp_env/lib/python3.12/site-packages/nvidia/libnvcomp/include   src/benchmark/spja_lz4_nvcomp_split_overlap.cu   -L ~/nvcomp_env/lib/python3.12/site-packages/nvidia/libnvcomp/lib64   -lnvcomp -llz4   -o bin/spja_lz4_nvcomp_split_overlap
+// LD_LIBRARY_PATH=~/nvcomp_env/lib/python3.12/site-packages/nvidia/libnvcomp/lib64:$LD_LIBRARY_PATH ./bin/spja_lz4_nvcomp_split_overlap

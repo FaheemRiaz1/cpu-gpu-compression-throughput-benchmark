@@ -4,7 +4,6 @@ import matplotlib.pyplot as plt
 # -------- LOAD --------
 df = pd.read_csv("results/simple_pipeline/csv_file/simple_results.csv")
 
-# Clean column names (IMPORTANT)
 df.columns = df.columns.str.strip()
 
 # Sort

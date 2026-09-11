@@ -1,0 +1,290 @@
+FILE NAME: docs/fastlanes_gpu.txt
+
+============================================================
+FastLanes GPU SPJA Benchmark
+============================================================
+
+Description
+
+This file documents the FastLanes GPU implementation used
+as an external baseline in the thesis.
+
+FastLanes uses a vector-oriented encoded representation that
+supports parallel decoding on the GPU.
+
+The implementation is used to compare FastLanes against the
+LZ4 + nvCOMP CPU-GPU pipeline.
+
+Pipeline evaluated:
+
+FastLanes Encoded Data
+→ CPU / GPU Work Split
+→ GPU FastLanes Decode
+→ SPJA Query Processing
+→ Result Collection
+
+The benchmark evaluates whether a compression format designed
+for parallel decoding provides benefits compared with the
+general-purpose LZ4 + nvCOMP pipeline.
+
+============================================================
+File Location
+============================================================
+
+Main SPJA implementation:
+
+external/baseline/fastlanes_gpu/spja_coproc_fastlanes.cu
+
+String SPJA implementation:
+
+external/baseline/fastlanes_gpu/spja_coproc_fastlanes_strings.cu
+
+Additional FastLanes co-processing implementation:
+
+external/baseline/fastlanes_gpu/coproc_fastlanes.cu
+
+============================================================
+Dependencies
+============================================================
+
+1. CUDA
+
+Check:
+
+nvcc --version
+
+------------------------------------------------------------
+
+2. NVIDIA GPU
+
+The thesis experiments were executed on:
+
+NVIDIA RTX A2000
+12 GB GPU memory
+
+------------------------------------------------------------
+
+3. FastLanes Source
+
+The required FastLanes-related source files are retained under:
+
+external/baseline/fastlanes_gpu/
+
+------------------------------------------------------------
+
+4. TPC-H Derived Input Data
+
+The benchmark uses columnar input generated from TPC-H data.
+
+Large generated datasets are not stored in Git.
+
+============================================================
+Execution
+============================================================
+
+The FastLanes SPJA experiments are executed through the
+corresponding benchmark source files and experiment scripts.
+
+For the x40 string SPJA experiment:
+
+scripts/run_fastlanes_spja_x40_strings.sh
+
+Run from the repository root:
+
+bash scripts/run_fastlanes_spja_x40_strings.sh
+
+============================================================
+Workload
+============================================================
+
+The main benchmark uses an SPJA workload derived from:
+
+LINEITEM
+ORDERS
+CUSTOMER
+
+The workload represents:
+
+Selection
+Projection
+Join
+Aggregation
+
+Relevant LINEITEM attributes include:
+
+orderkey
+quantity
+extendedprice
+
+Additional relationship information is obtained from:
+
+ORDERS
+CUSTOMER
+
+The workload includes filtering based on quantity and
+nation-related information.
+
+============================================================
+CPU-GPU Co-Processing
+============================================================
+
+The benchmark evaluates different divisions of work between
+the CPU and GPU.
+
+Example split configurations include:
+
+100% CPU / 0% GPU
+
+75% CPU / 25% GPU
+
+50% CPU / 50% GPU
+
+25% CPU / 75% GPU
+
+0% CPU / 100% GPU
+
+The purpose is to determine whether simultaneous CPU and GPU
+processing can outperform either processor working alone.
+
+============================================================
+Key Implementation Details
+============================================================
+
+FastLanes Data
+
+Input values are stored using the FastLanes representation.
+
+The encoded layout is designed so that groups of values can
+be reconstructed in parallel.
+
+------------------------------------------------------------
+
+GPU Decode
+
+GPU threads reconstruct encoded values in parallel.
+
+This differs from the LZ4 + nvCOMP implementation where
+general-purpose compressed chunks are first decompressed
+using nvCOMP.
+
+------------------------------------------------------------
+
+SPJA Processing
+
+Decoded values are used by the analytical workload for:
+
+- filtering
+- join-related processing
+- aggregation
+
+The benchmark measures complete processing behavior rather
+than only the decode kernel.
+
+============================================================
+Output
+============================================================
+
+Console Output
+
+Displays benchmark timing and throughput information for the
+tested CPU-GPU configurations.
+
+------------------------------------------------------------
+
+CSV Output
+
+Relevant FastLanes results are stored under:
+
+results/fastlanes_lz4nvcomp_dowda/
+
+String SPJA results:
+
+results/fastlanes_lz4nvcomp_dowda/csv/fastlanes_spja_coproc_x40_strings_results.csv
+
+============================================================
+Measured Components
+============================================================
+
+Depending on the benchmark configuration, measurements include:
+
+- CPU processing time
+- GPU processing time
+- FastLanes decode time
+- CPU-GPU workload distribution
+- End-to-end execution time
+- Effective throughput
+
+============================================================
+Throughput Metric
+============================================================
+
+Throughput is calculated using the amount of original
+uncompressed input processed per unit of time.
+
+Higher throughput indicates that the complete analytical
+pipeline processes more input data per second.
+
+The throughput metric allows comparison between:
+
+- CPU-only execution
+- GPU-only execution
+- CPU-GPU co-processing
+- LZ4 + nvCOMP
+- FastLanes
+
+============================================================
+Memory Limitation
+============================================================
+
+FastLanes requires memory for:
+
+- encoded input
+- decoded values
+- intermediate buffers
+- query-processing data
+
+For sufficiently large inputs, the FastLanes implementation
+can exceed available GPU memory.
+
+During the thesis experiments, some very large configurations
+could therefore not be executed with FastLanes on the
+12 GB RTX A2000.
+
+This limitation is considered when comparing the baseline
+with the LZ4 + nvCOMP implementation.
+
+============================================================
+Notes
+============================================================
+
+- FastLanes is used as a comparison baseline.
+
+- It uses a different encoded representation from LZ4.
+
+- FastLanes supports highly parallel reconstruction.
+
+- The same general SPJA workload is used to improve
+  comparability between implementations.
+
+- Large generated input files are excluded from Git.
+
+- Only FastLanes source files required by the thesis are kept
+  in the repository.
+
+============================================================
+Conclusion
+============================================================
+
+The FastLanes benchmark provides an alternative point in the
+compressed query-processing design space.
+
+It demonstrates the performance characteristics of:
+
+- vector-oriented encoding
+- parallel GPU decoding
+- CPU-GPU co-processing
+- compressed analytical query execution
+
+The results are compared with the main LZ4 + nvCOMP pipeline
+to evaluate the trade-offs between general-purpose compression
+and a representation designed for parallel decoding.

@@ -1,0 +1,5 @@
+Column,Original_MiB,Compressed_MiB,Reduction_Percent
+orderkey,193.653,53.7306,72.2543
+quantity,193.653,65.1565,66.3541
+extendedprice,193.653,193.131,0.269608
+total,580.96,312.018,46.2927

@@ -1,192 +1,193 @@
-import os
-import numpy as np
+import argparse
+from array import array
+from pathlib import Path
+
 import lz4.frame
 
-# Convert compressed TPC-H tables into binary columns for the benchmark.
 
-input_dir = "data/tpch_real/sf1"
-compressed_dir = os.path.join(input_dir, "compressed")
+DEFAULT_SCALE_FACTORS = [10]
+DEFAULT_INPUT_ROOT = Path("data/tpch_real")
+DEFAULT_OUTPUT_ROOT = Path("data")
 
-output_dir = "data/tpch_columnar"
-os.makedirs(output_dir, exist_ok=True)
-
-lineitem_path = os.path.join(compressed_dir, "lineitem.tbl.lz4")
-part_path = os.path.join(compressed_dir, "part.tbl.lz4")
-orders_path = os.path.join(compressed_dir, "orders.tbl.lz4")
-customer_path = os.path.join(compressed_dir, "customer.tbl.lz4")
+LINEITEM_BUFFER_ROWS = 1_000_000
 
 
-def open_text_or_lz4(path):
-    # Mostly used for .tbl.lz4 files, but normal text files also work.
-    if path.endswith(".lz4"):
+def sf_label(sf: int) -> str:
+    return f"sf{sf}"
+
+
+def open_text_or_lz4(path: Path):
+    if str(path).endswith(".lz4"):
         return lz4.frame.open(path, mode="rt", encoding="utf-8")
     return open(path, "r", encoding="utf-8")
 
 
-for path in [lineitem_path, part_path, orders_path, customer_path]:
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Missing file: {path}")
+def find_table_path(input_dir: Path, table_name: str) -> Path:
+    compressed_path = input_dir / "compressed" / f"{table_name}.tbl.lz4"
+    raw_path = input_dir / f"{table_name}.tbl"
+
+    if compressed_path.exists():
+        return compressed_path
+
+    if raw_path.exists():
+        return raw_path
+
+    raise FileNotFoundError(
+        f"Missing both {compressed_path} and {raw_path}"
+    )
 
 
-print("Reading compressed official tpch-dbgen .tbl.lz4 files")
-print(f"LINEITEM: {lineitem_path}")
-print(f"PART:     {part_path}")
-print(f"ORDERS:   {orders_path}")
-print(f"CUSTOMER: {customer_path}")
+def flush_buffer(buffer: array, file_handle):
+    if buffer:
+        buffer.tofile(file_handle)
+        del buffer[:]
 
-orderkey = []
-partkey = []
-quantity = []
-extendedprice = []
-linestatus = []
 
-# LINEITEM is the main scanned table.
-with open_text_or_lz4(lineitem_path) as f:
-    for line in f:
-        fields = line.rstrip("\n").split("|")
+def convert_quantity_only(lineitem_path: Path, output_dir: Path, suffix: str) -> int:
+    """
+    Convert only LINEITEM.quantity.
 
-        if len(fields) < 10:
-            continue
+    Outputs:
+      quantity_{suffix}.bin      int32
+      quantity_{suffix}_u8.bin   uint8
 
-        orderkey.append(int(fields[0]))
-        partkey.append(int(fields[1]))
-        quantity.append(int(float(fields[4])))
+    This avoids memory/disk usage for unused SPJA columns.
+    """
+    print("\nReading LINEITEM quantity only:")
+    print(f"  {lineitem_path}")
 
-        # Store price as integer cents for the C++/CUDA benchmark.
-        extendedprice.append(int(round(float(fields[5]) * 100.0)))
+    out_quantity_i32 = output_dir / f"quantity_{suffix}.bin"
+    out_quantity_u8 = output_dir / f"quantity_{suffix}_u8.bin"
 
-        status = fields[9]
-        if status == "O":
-            linestatus.append(1)
-        elif status == "F":
-            linestatus.append(2)
-        else:
-            linestatus.append(0)
+    quantity_i32_buf = array("i")
+    quantity_u8_buf = array("B")
 
-orderkey = np.asarray(orderkey, dtype=np.int32)
-partkey = np.asarray(partkey, dtype=np.int32)
-quantity = np.asarray(quantity, dtype=np.int32)
-extendedprice = np.asarray(extendedprice, dtype=np.int32)
-linestatus = np.asarray(linestatus, dtype=np.int32)
+    if quantity_i32_buf.itemsize != 4:
+        raise RuntimeError(
+            "array('i') is not 4 bytes on this platform."
+        )
 
-print(f"LINEITEM rows: {len(partkey)}")
+    row_count = 0
+    min_quantity = None
+    max_quantity = None
 
-max_partkey = 0
-part_rows = []
+    with (
+        open_text_or_lz4(lineitem_path) as f,
+        open(out_quantity_i32, "wb") as f_i32,
+        open(out_quantity_u8, "wb") as f_u8,
+    ):
+        for line in f:
+            fields = line.rstrip("\n").split("|")
 
-# PART lookup is still written for older/future query variants.
-with open_text_or_lz4(part_path) as f:
-    for line in f:
-        fields = line.rstrip("\n").split("|")
+            if len(fields) < 5:
+                continue
 
-        if len(fields) < 9:
-            continue
+            quantity_value = int(float(fields[4]))
 
-        p_partkey = int(fields[0])
-        p_type = fields[4]
-        p_size = int(fields[5])
+            if quantity_value < 0 or quantity_value > 255:
+                raise ValueError(
+                    f"quantity value {quantity_value} cannot be stored as uint8"
+                )
 
-        max_partkey = max(max_partkey, p_partkey)
-        part_rows.append((p_partkey, p_type, p_size))
+            if min_quantity is None or quantity_value < min_quantity:
+                min_quantity = quantity_value
 
-part_category = np.zeros(max_partkey + 1, dtype=np.int32)
-part_factor = np.ones(max_partkey + 1, dtype=np.int32)
+            if max_quantity is None or quantity_value > max_quantity:
+                max_quantity = quantity_value
 
-for p_partkey, p_type, p_size in part_rows:
-    if "BRASS" in p_type:
-        category = 3
-    elif "STEEL" in p_type:
-        category = 2
-    elif "COPPER" in p_type:
-        category = 1
-    else:
-        category = 0
+            quantity_i32_buf.append(quantity_value)
+            quantity_u8_buf.append(quantity_value)
 
-    factor = (p_size % 10) + 1
+            row_count += 1
 
-    part_category[p_partkey] = category
-    part_factor[p_partkey] = factor
+            if row_count % LINEITEM_BUFFER_ROWS == 0:
+                flush_buffer(quantity_i32_buf, f_i32)
+                flush_buffer(quantity_u8_buf, f_u8)
+                print(f"  processed rows: {row_count:,}")
 
-print(f"PART rows: {len(part_rows)}")
-print(f"Max partkey: {max_partkey}")
-print(f"Rows with category == 3: {np.sum(part_category == 3)}")
+        flush_buffer(quantity_i32_buf, f_i32)
+        flush_buffer(quantity_u8_buf, f_u8)
 
-max_orderkey = 0
-order_rows = []
+    print(f"\nLINEITEM rows: {row_count:,}")
+    print(f"quantity min: {min_quantity}")
+    print(f"quantity max: {max_quantity}")
 
-# Build orderkey -> custkey lookup for the current query.
-with open_text_or_lz4(orders_path) as f:
-    for line in f:
-        fields = line.rstrip("\n").split("|")
+    print("\nWritten files:")
+    for path in [out_quantity_i32, out_quantity_u8]:
+        print(f"  {path}  ({path.stat().st_size / (1024 * 1024):.2f} MiB)")
 
-        if len(fields) < 2:
-            continue
+    return row_count
 
-        o_orderkey = int(fields[0])
-        o_custkey = int(fields[1])
 
-        max_orderkey = max(max_orderkey, o_orderkey)
-        order_rows.append((o_orderkey, o_custkey))
+def convert_scale_factor(sf: int, input_root: Path, output_root: Path):
+    suffix = sf_label(sf)
 
-order_custkey = np.zeros(max_orderkey + 1, dtype=np.int32)
+    input_dir = input_root / suffix
+    output_dir = output_root / f"tpch_columnar_{suffix}"
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-for o_orderkey, o_custkey in order_rows:
-    order_custkey[o_orderkey] = o_custkey
+    print("\n============================================================")
+    print(f"Converting TPC-H {suffix.upper()} quantity only")
+    print("============================================================")
+    print(f"Input directory:  {input_dir}")
+    print(f"Output directory: {output_dir}")
 
-print(f"ORDERS rows: {len(order_rows)}")
-print(f"Max orderkey: {max_orderkey}")
+    if not input_dir.exists():
+        raise FileNotFoundError(f"Input directory does not exist: {input_dir}")
 
-max_custkey = 0
-customer_rows = []
+    lineitem_path = find_table_path(input_dir, "lineitem")
 
-# Build custkey -> nation lookup.
-with open_text_or_lz4(customer_path) as f:
-    for line in f:
-        fields = line.rstrip("\n").split("|")
+    print("\nUsing input file:")
+    print(f"  LINEITEM: {lineitem_path}")
 
-        if len(fields) < 4:
-            continue
+    convert_quantity_only(lineitem_path, output_dir, suffix)
 
-        c_custkey = int(fields[0])
-        c_nationkey = int(fields[3])
+    print(f"\nDone converting {suffix.upper()} quantity only.")
 
-        max_custkey = max(max_custkey, c_custkey)
-        customer_rows.append((c_custkey, c_nationkey))
 
-customer_nation = np.zeros(max_custkey + 1, dtype=np.int32)
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Convert only TPC-H LINEITEM.quantity to int32 and uint8 binary columns."
+    )
 
-for c_custkey, c_nationkey in customer_rows:
-    customer_nation[c_custkey] = c_nationkey
+    parser.add_argument(
+        "--sf",
+        type=int,
+        nargs="+",
+        default=DEFAULT_SCALE_FACTORS,
+        help="Scale factor(s) to convert, e.g. --sf 1 10",
+    )
 
-print(f"CUSTOMER rows: {len(customer_rows)}")
-print(f"Max custkey: {max_custkey}")
+    parser.add_argument(
+        "--input-root",
+        type=Path,
+        default=DEFAULT_INPUT_ROOT,
+        help="Root folder containing sf1/sf10/etc, default: data/tpch_real",
+    )
 
-# Write binary columns used by the benchmark.
-orderkey.tofile(os.path.join(output_dir, "orderkey_sf1.bin"))
-partkey.tofile(os.path.join(output_dir, "partkey_sf1.bin"))
-quantity.tofile(os.path.join(output_dir, "quantity_sf1.bin"))
-extendedprice.tofile(os.path.join(output_dir, "extendedprice_sf1.bin"))
-linestatus.tofile(os.path.join(output_dir, "linestatus_sf1.bin"))
+    parser.add_argument(
+        "--output-root",
+        type=Path,
+        default=DEFAULT_OUTPUT_ROOT,
+        help="Root output folder, default: data",
+    )
 
-part_category.tofile(os.path.join(output_dir, "part_category_sf1.bin"))
-part_factor.tofile(os.path.join(output_dir, "part_factor_sf1.bin"))
+    return parser.parse_args()
 
-order_custkey.tofile(os.path.join(output_dir, "order_custkey_sf1.bin"))
-customer_nation.tofile(os.path.join(output_dir, "customer_nation_sf1.bin"))
 
-print("\nWritten binary column files:")
-for name in [
-    "orderkey_sf1.bin",
-    "partkey_sf1.bin",
-    "quantity_sf1.bin",
-    "extendedprice_sf1.bin",
-    "linestatus_sf1.bin",
-    "part_category_sf1.bin",
-    "part_factor_sf1.bin",
-    "order_custkey_sf1.bin",
-    "customer_nation_sf1.bin",
-]:
-    path = os.path.join(output_dir, name)
-    print(f"  {path}  ({os.path.getsize(path) / (1024 * 1024):.2f} MiB)")
+def main():
+    args = parse_args()
 
-print("\nDone.")
+    print("TPC-H quantity-only converter")
+    print("Scale factors:", args.sf)
+    print("Input root:", args.input_root)
+    print("Output root:", args.output_root)
+
+    for sf in args.sf:
+        convert_scale_factor(sf, args.input_root, args.output_root)
+
+    print("\nAll requested scale factors converted successfully.")
+
+
+if __name__ == "__main__":
+    main()

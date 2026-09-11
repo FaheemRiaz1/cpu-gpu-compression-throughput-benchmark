@@ -1,0 +1,1 @@
+x80 / ~5.5GB tested: best split still 75% CPU / 25% GPU; larger data did not shift LZ4/nvCOMP sweet spot.

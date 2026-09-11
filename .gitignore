@@ -44,7 +44,42 @@ c
 scripts/tpch_columnar/check_columnar_lz4_ratio
 scripts/tpch_columnar/check_columnar_lz4_delta_ratio
 src/benchmark/spja_cpu_gpu_split.cu
+src/benchmark/spja_dpf_fused_x401.cu
 results/spja_workload/csv/spja_lz4_nvcomp_hybrid_split_results.csv
 results/spja_workload/graph_plotting/plot_overlap.py
 results/spja_workload/graphs/tpch_area_sweet_spot.png
 tools/tpch-dbgen/
+# External baseline source archives/code
+# external/
+results/nvcomp_lz4_vs_fastlane/summary
+build/ 
+build_fmt/
+
+# Large generated benchmark data
+results/baseline_fastlanes_gpu/quantity_sf10/
+results/baseline_fastlanes_gpu/quantity_sf10_sorted_lz4best/
+results/baseline_fastlanes_gpu/quantity_sf10_sorted_lz4best_23x/
+results/baseline_fastlanes_gpu/quantity_sf10_sorted_lz4best_45x/
+
+
+
+results/nvcomp_lz4_vs_fastlane/
+*.dat
+*.bin
+
+# Keep FastLanes string benchmark files
+!external/
+external/*
+!external/baseline/
+external/baseline/*
+!external/baseline/fastlanes_gpu/
+external/baseline/fastlanes_gpu/*
+!external/baseline/fastlanes_gpu/spja_coproc_fastlanes_strings.cu
+!external/baseline/fastlanes_gpu/spja_coproc_fastlanes.cu
+!external/baseline/fastlanes_gpu/coproc_fastlanes.cu
+
+!scripts/run_fastlanes_spja_x40_strings.sh
+
+!results/fastlanes_lz4nvcomp_dowda/
+!results/fastlanes_lz4nvcomp_dowda/csv/
+!results/fastlanes_lz4nvcomp_dowda/csv/fastlanes_spja_coproc_x40_strings_results.csv

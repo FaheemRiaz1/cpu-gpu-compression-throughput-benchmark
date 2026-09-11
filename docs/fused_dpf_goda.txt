@@ -1,0 +1,277 @@
+FILE NAME: docs/fused_dpf_goda.txt
+
+============================================================
+Fused Decode + SPJA Benchmark
+============================================================
+
+Description
+
+This file documents the fused decode-and-query-processing
+baseline used in the thesis.
+
+The implementation is inspired by fused processing approaches
+where decoding and query execution are performed closely
+together.
+
+The main objective is to reduce intermediate data
+materialization and memory traffic between decompression and
+query execution.
+
+Pipeline evaluated:
+
+Encoded Input
+→ Decode Required Values
+→ SPJA Processing
+→ Result Generation
+→ D2H
+
+This provides an additional comparison against the separate
+LZ4 + nvCOMP decompression and query-processing pipeline.
+
+============================================================
+File Location
+============================================================
+
+The fused benchmark implementation is located with the thesis
+benchmark source files under:
+
+src/benchmark/
+
+The implementation is an experimental thesis baseline and is
+not intended to be a complete reproduction of an external
+database system.
+
+============================================================
+Dependencies
+============================================================
+
+1. CUDA
+
+Check:
+
+nvcc --version
+
+------------------------------------------------------------
+
+2. NVIDIA GPU
+
+The thesis experiments were executed using:
+
+NVIDIA RTX A2000
+12 GB GPU memory
+
+------------------------------------------------------------
+
+3. TPC-H Derived Columnar Data
+
+The benchmark operates on the same general TPC-H-derived SPJA
+input used for the other thesis implementations.
+
+Generated binary input files are excluded from Git.
+
+============================================================
+Pipeline
+============================================================
+
+Standard LZ4 + nvCOMP approach:
+
+CPU LZ4 Compression
+→ H2D Compressed Transfer
+→ nvCOMP GPU Decompression
+→ Materialized Decompressed Data
+→ GPU SPJA Processing
+→ D2H
+
+------------------------------------------------------------
+
+Fused approach:
+
+Encoded Input
+→ Decode Required Value
+→ Immediately Process Value
+→ SPJA Result
+→ D2H
+
+The fused design reduces the separation between the decode
+stage and the analytical processing stage.
+
+============================================================
+Workload
+============================================================
+
+The benchmark uses the SPJA workload derived from:
+
+LINEITEM
+ORDERS
+CUSTOMER
+
+Operations represented by the workload:
+
+Selection
+Projection
+Join
+Aggregation
+
+Relevant LINEITEM data includes:
+
+orderkey
+quantity
+extendedprice
+
+Join-related information is derived from:
+
+ORDERS
+CUSTOMER
+
+Filtering includes quantity and nation-related conditions.
+
+============================================================
+Key Implementation Details
+============================================================
+
+Traditional Pipeline
+
+The decompression stage creates an intermediate decompressed
+representation before the query kernel processes the data.
+
+This can introduce:
+
+- additional global memory writes
+- additional global memory reads
+- intermediate buffer requirements
+- synchronization overhead
+
+------------------------------------------------------------
+
+Fused Pipeline
+
+The fused implementation attempts to use reconstructed values
+directly during query processing.
+
+Conceptually:
+
+decode(value)
+→ evaluate predicate
+→ perform required SPJA operation
+→ continue
+
+This reduces the need to write every reconstructed value to a
+large intermediate decompressed array.
+
+============================================================
+GPU Processing
+============================================================
+
+GPU threads process encoded input values in parallel.
+
+Decoded values are immediately used for query-related
+operations where possible.
+
+The implementation therefore combines work that would
+otherwise belong to separate decode and compute stages.
+
+============================================================
+Measured Components
+============================================================
+
+The benchmark focuses on end-to-end processing cost.
+
+Relevant costs include:
+
+- encoded input processing
+- GPU decoding
+- query execution
+- memory accesses
+- synchronization
+- intermediate materialization
+- result movement
+- total execution time
+
+============================================================
+Throughput Metric
+============================================================
+
+Effective throughput is based on the amount of original input
+data processed divided by total processing time.
+
+Throughput allows comparison between implementations even
+when their encoded representations and intermediate data
+sizes differ.
+
+============================================================
+Comparison
+============================================================
+
+The fused baseline is compared with the main:
+
+LZ4 + nvCOMP pipeline
+
+and is used as an additional design comparison alongside the
+FastLanes experiments.
+
+The comparison evaluates whether reducing intermediate memory
+movement can improve complete analytical query-processing
+performance.
+
+============================================================
+Expected Behavior
+============================================================
+
+The fused approach can benefit when:
+
+- decoding is relatively lightweight
+- reconstructed values can be consumed immediately
+- intermediate memory traffic is significant
+- the query performs useful work directly after decoding
+
+------------------------------------------------------------
+
+The benefit may be smaller when:
+
+- decoding itself dominates execution
+- additional query logic reduces parallel efficiency
+- synchronization or control flow becomes expensive
+- the dataset is too small for memory traffic to dominate
+
+============================================================
+Notes
+============================================================
+
+- This implementation is an experimental thesis baseline.
+
+- It investigates fused decode and analytical processing.
+
+- It is not a full reproduction of an external database
+  engine.
+
+- The purpose is to investigate architectural trade-offs.
+
+- End-to-end performance is more important than decode-kernel
+  performance alone.
+
+============================================================
+Conclusion
+============================================================
+
+The fused benchmark evaluates whether decode and analytical
+query processing should remain separate or be more tightly
+integrated.
+
+It demonstrates the trade-off between:
+
+Separate Processing
+
+Decode
+→ Materialize
+→ Read Again
+→ Query
+
+and:
+
+Fused Processing
+
+Decode
+→ Immediately Process
+
+The results provide an additional comparison point for the
+main LZ4 + nvCOMP CPU-GPU processing pipeline.
