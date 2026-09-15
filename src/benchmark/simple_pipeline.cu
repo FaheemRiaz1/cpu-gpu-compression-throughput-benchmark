@@ -6,6 +6,8 @@
 #include <chrono>
 #include <fstream>
 #include <iomanip>
+#include <string>
+#include <cstdlib>
 #include <cuda_runtime.h>
 
 // Fail fast on CUDA runtime errors.
@@ -102,7 +104,16 @@ int main() {
     std::system("mkdir -p results/simple_pipeline/csv_file");
     std::system("mkdir -p results/graphs");
 
-    // Run length controls RLE effectiveness; sizes exercise several input scales.
+    // Store throughput measurements used by the simple-pipeline plots.
+    std::ofstream csv("results/simple_pipeline/csv_file/simple_results.csv");
+
+    if (!csv) {
+        std::cerr << "Could not open simple_results.csv\n";
+        return 1;
+    }
+
+    csv << "MB,RunLen,BaselineGBs,CompressedGBs\n";
+
     std::vector<int> run_lengths = {2, 32, 128};
     std::vector<int> sizes = {1, 4, 16, 64, 128};
 
@@ -191,6 +202,12 @@ int main() {
                       << "\n";
 
             std::cout << "\033[0m";
+
+            // Save the same measured throughputs printed above.
+            csv << mb << ","
+                << run_len << ","
+                << base_gbps << ","
+                << comp_gbps << "\n";
 
             cudaFree(d_comp);
             cudaFree(d_data);
