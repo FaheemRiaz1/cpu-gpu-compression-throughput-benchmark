@@ -1,1298 +1,210 @@
+// Early RLE prototype used to compare an uncompressed CPU-to-GPU path
+// against a compressed path with GPU-side decompression.
+
+#include <iostream>
+#include <vector>
 #include <chrono>
-#include <cstdlib>
-#include <cstring>
 #include <fstream>
 #include <iomanip>
-#include <iostream>
-#include <random>
-#include <stdexcept>
-#include <string>
-#include <vector>
-#include <algorithm>
-#include <cmath>
-
 #include <cuda_runtime.h>
-#include <lz4.h>
-#include <nvcomp/lz4.h>
 
+// Fail fast on CUDA runtime errors.
+#define CHECK_CUDA(call) \
+do { \
+    cudaError_t err = call; \
+    if (err != cudaSuccess) { \
+        std::cerr << "CUDA Error: " << cudaGetErrorString(err) << std::endl; \
+        exit(1); \
+    } \
+} while(0)
 
-// Report CUDA failures with their source location and terminate immediately.
-inline void cuda_check(cudaError_t e, const char* file, int line) {
-    if (e != cudaSuccess) {
-        std::cerr << "CUDA error: " << cudaGetErrorString(e)
-                  << " at " << file << ":" << line << std::endl;
-        std::exit(EXIT_FAILURE);
-    }
-}
-
-
-// Apply the same fail-fast handling to nvCOMP API calls.
-inline void nvcomp_check(nvcompStatus_t s, const char* file, int line) {
-    if (s != nvcompSuccess) {
-        std::cerr << "nvCOMP error: status=" << static_cast<int>(s)
-                  << " at " << file << ":" << line << std::endl;
-        std::exit(EXIT_FAILURE);
-    }
-}
-
-
-#define CUDA_CHECK(x) cuda_check((x), __FILE__, __LINE__)
-#define NVCOMP_CHECK(x) nvcomp_check((x), __FILE__, __LINE__)
-
-
-// Input distributions used to study how compressibility affects
-// the compressed CPU-to-GPU processing pipeline.
-enum class DataMode {
-    HIGH_COMPRESSIBLE,
-    MEDIUM_COMPRESSIBLE,
-    RANDOM_DATA
+// One run-length encoded pair.
+struct RLEPair {
+    int value;
+    int count;
 };
 
+// Generate deterministic runs whose length controls compressibility.
+std::vector<int> generate_data(size_t N, int run_len) {
+    std::vector<int> data(N);
+    int val = 1;
 
-// Short labels used in terminal output and result files.
-static const char* mode_to_string(DataMode mode) {
-    switch (mode) {
-        case DataMode::HIGH_COMPRESSIBLE:   return "HIGH";
-        case DataMode::MEDIUM_COMPRESSIBLE: return "MEDIUM";
-        case DataMode::RANDOM_DATA:         return "RANDOM";
-        default:                            return "UNKNOWN";
+    for (size_t i = 0; i < N; i++) {
+        data[i] = val;
+        if ((i + 1) % run_len == 0) val++;
     }
+    return data;
 }
 
+// CPU-side run-length encoding.
+std::vector<RLEPair> compress(const std::vector<int>& input) {
+    std::vector<RLEPair> out;
 
-// Lightweight device computation applied identically after data reaches
-// the GPU. Each thread updates one integer element.
-__global__ void compute_kernel(int* data, int n) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int curr = input[0];
+    int count = 1;
 
-    if (i < n) {
-        data[i] *= 2;
+    for (size_t i = 1; i < input.size(); i++) {
+        if (input[i] == curr) count++;
+        else {
+            out.push_back({curr, count});
+            curr = input[i];
+            count = 1;
+        }
     }
+    out.push_back({curr, count});
+    return out;
 }
 
+// GPU-side RLE decompression.
+// Each thread handles one pair; computing the output offset requires
+// scanning all preceding pair lengths, giving this prototype O(n^2) work.
+__global__ void decompress_kernel(RLEPair* comp, int* out, int num_pairs, int N) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
-// Return elapsed wall-clock time in milliseconds.
-template <typename T1, typename T2>
-double ms_between(const T1& a, const T2& b) {
-    return std::chrono::duration<double, std::milli>(b - a).count();
-}
+    if (idx < num_pairs) {
+        int start = 0;
 
+        // O(n²) bottleneck
+        for (int i = 0; i < idx; i++)
+            start += comp[i].count;
 
-// Convert a byte count to binary GiB for throughput calculations.
-static double bytes_to_gib(size_t bytes) {
-    return static_cast<double>(bytes) /
-           (1024.0 * 1024.0 * 1024.0);
-}
+        for (int j = 0; j < comp[idx].count; j++) {
+            int out_idx = start + j;
 
+            int val = comp[idx].value;
 
-// Arithmetic mean over repeated measurements.
-static double mean(const std::vector<double>& values) {
-    if (values.empty()) return 0.0;
-
-    double sum = 0.0;
-
-    for (double v : values) {
-        sum += v;
-    }
-
-    return sum / static_cast<double>(values.size());
-}
-
-
-// Sample standard deviation used to report run-to-run variation.
-static double stddev_sample(const std::vector<double>& values) {
-    if (values.size() < 2) return 0.0;
-
-    const double avg = mean(values);
-
-    double var = 0.0;
-
-    for (double v : values) {
-        const double diff = v - avg;
-        var += diff * diff;
-    }
-
-    var /= static_cast<double>(values.size() - 1);
-
-    return std::sqrt(var);
-}
-
-
-// Generate deterministic inputs with different levels of compressibility.
-// The fixed random seed keeps the generated data reproducible across runs.
-static void fill_input(int* data, size_t n, DataMode mode) {
-    std::mt19937 rng(42);
-    std::uniform_int_distribution<int> dist(0, 1000000);
-
-    for (size_t i = 0; i < n; ++i) {
-        switch (mode) {
-
-            // Constant values provide the highly compressible case.
-            case DataMode::HIGH_COMPRESSIBLE:
-                data[i] = 0;
-                break;
-
-            // Mostly repeated local values with one random value per
-            // eight-element group provide the intermediate case.
-            case DataMode::MEDIUM_COMPRESSIBLE:
-                switch (i % 8) {
-                    case 0:
-                        data[i] = dist(rng);
-                        break;
-
-                    default:
-                        data[i] =
-                            static_cast<int>((i / 8) % 128);
-                        break;
-                }
-                break;
-
-            // Independent pseudo-random values represent poorly
-            // compressible input.
-            case DataMode::RANDOM_DATA:
-                data[i] = dist(rng);
-                break;
+            if (out_idx < N)
+                out[out_idx] = val;
         }
     }
 }
 
+// Lightweight GPU computation applied after transfer/decompression.
+__global__ void compute_kernel(int* data, int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (i < N) {
+        int val = data[i];
+
+        // Repeated arithmetic keeps the compute stage identical for both paths.
+        for (int k = 0; k < 50; k++) {
+            val = val * 2 + 1;
+            val = val / 2;
+        }
+
+        data[i] = val;
+    }
+}
 
 int main() {
-    try {
+    std::system("mkdir -p results");
+    std::system("mkdir -p results/simple_pipeline");
+    std::system("mkdir -p results/simple_pipeline/csv_file");
+    std::system("mkdir -p results/graphs");
 
-        CUDA_CHECK(cudaSetDevice(0));
+    // Run length controls RLE effectiveness; sizes exercise several input scales.
+    std::vector<int> run_lengths = {2, 32, 128};
+    std::vector<int> sizes = {1, 4, 16, 64, 128};
 
-        std::system("mkdir -p bin");
-        std::system("mkdir -p results");
+    std::cout << "\n======= SIMPLE PIPELINE =======\n\n";
 
+    std::cout << std::setw(6) << "MB"
+              << std::setw(8) << "RunLen"
+              << std::setw(14) << "Base GB/s"
+              << std::setw(14) << "Comp GB/s"
+              << std::setw(10) << "Winner"
+              << "\n";
 
-        // A single stream preserves operation ordering for both benchmark
-        // paths while still allowing asynchronous CUDA API calls.
-        cudaStream_t stream;
-        CUDA_CHECK(cudaStreamCreate(&stream));
+    std::cout << "-------------------------------------------------------------\n";
+    std::cout << std::fixed;
 
+    for (auto run_len : run_lengths) {
 
-        // Fixed benchmark configuration.
-        const size_t chunk_size = 1ULL << 22; // 4 MB
-        const int warmup = 2;
-        const int iterations = 10;
+        for (auto mb : sizes) {
 
-        const std::vector<size_t> sizes_mb = {
-            4,
-            16,
-            64,
-            256,
-            512,
-            1024
-        };
+            size_t bytes = mb * 1024 * 1024;
+            size_t N = bytes / sizeof(int);
 
-        const std::vector<DataMode> modes = {
-            DataMode::HIGH_COMPRESSIBLE,
-            DataMode::MEDIUM_COMPRESSIBLE,
-            DataMode::RANDOM_DATA
-        };
+            // Preserve the same logical input for both benchmark paths.
+            auto original_data = generate_data(N, run_len);
+            auto data = original_data;
 
+            int* d_data;
+            CHECK_CUDA(cudaMalloc(&d_data, bytes));
 
-        // Aggregated measurements for each input size and data mode.
-        std::ofstream csv(
-            "results/lz4_nvcomp_pipeline/csv_file/"
-            "parallel_cpu_lz4_nvcomp_full_pipeline_results.csv"
-        );
+            // Baseline path: raw H2D -> GPU compute -> raw D2H.
+            auto start = std::chrono::high_resolution_clock::now();
 
-        csv << "Mode,MB,Ratio,"
-               "Base_GBps_Avg,Base_GBps_StdDev,"
-               "Pipe_Phys_GBps_Avg,Pipe_Phys_GBps_StdDev,"
-               "Pipe_Eff_GBps_Avg,Pipe_Eff_GBps_StdDev,"
-               "Base_ms_Avg,Base_ms_StdDev,"
-               "CPUCompOnce_ms,"
-               "H2DComp_ms_Avg,Decomp_ms_Avg,Kernel_ms_Avg,D2H_ms_Avg,"
-               "Pipe_ms_Avg,Pipe_ms_StdDev,Winner\n";
+            cudaMemcpy(d_data, data.data(), bytes, cudaMemcpyHostToDevice);
 
+            compute_kernel<<<(N+255)/256, 256>>>(d_data, N);
 
-        // Per-run measurements are retained separately from the averages.
-        std::ofstream detail_csv(
-            "results/lz4_nvcomp_pipeline/csv_file/"
-            "parallel_cpu_lz4_nvcomp_full_pipeline_detailed_runs.csv"
-        );
+            cudaMemcpy(data.data(), d_data, bytes, cudaMemcpyDeviceToHost);
 
-        detail_csv << "Mode,MB,Run,"
-                   << "Base_ms,Base_GBps,"
-                   << "Pipe_ms,Pipe_Phys_GBps,Pipe_Eff_GBps,"
-                   << "H2DComp_ms,Decomp_ms,Kernel_ms,D2H_ms\n";
+            cudaDeviceSynchronize();
 
+            auto end = std::chrono::high_resolution_clock::now();
 
-        std::cout << std::fixed << std::setprecision(2);
+            double base_ms = std::chrono::duration<double, std::milli>(end - start).count();
+            double base_gbps = (bytes / 1e9) / (base_ms / 1000.0);
 
-        std::cout << std::left
-                  << std::setw(10) << "MODE"
-                  << std::setw(8)  << "MB"
-                  << std::setw(10) << "RATIO"
-                  << std::setw(18) << "BASE GB/s"
-                  << std::setw(20) << "PIPE phys"
-                  << std::setw(20) << "PIPE eff"
-                  << std::setw(10) << "WINNER"
-                  << "\n";
+            // Compressed path: CPU RLE compression -> compressed H2D ->
+            // GPU decompression -> GPU compute -> raw D2H.
+            data = original_data;  // Reset input before measuring the second path.
 
-        std::cout
-            << "--------------------------------------------------------------------------------------------------\n";
+            start = std::chrono::high_resolution_clock::now();
 
+            auto comp = compress(data);
 
-        // Evaluate every input distribution at every configured data size.
-        for (DataMode mode : modes) {
+            RLEPair* d_comp;
+            CHECK_CUDA(cudaMalloc(&d_comp, comp.size() * sizeof(RLEPair)));
 
-            for (size_t mb : sizes_mb) {
+            cudaMemcpy(d_comp, comp.data(),
+                       comp.size() * sizeof(RLEPair),
+                       cudaMemcpyHostToDevice);
 
-                const size_t total_bytes =
-                    mb * 1024ULL * 1024ULL;
+            decompress_kernel<<<(comp.size()+255)/256, 256>>>(
+                d_comp, d_data, comp.size(), N);
 
-                const size_t n_ints =
-                    total_bytes / sizeof(int);
+            compute_kernel<<<(N+255)/256, 256>>>(d_data, N);
 
-                const double total_gib =
-                    bytes_to_gib(total_bytes);
+            cudaMemcpy(data.data(), d_data, bytes, cudaMemcpyDeviceToHost);
 
-                const size_t num_chunks =
-                    (total_bytes + chunk_size - 1) /
-                    chunk_size;
+            cudaDeviceSynchronize();
 
+            end = std::chrono::high_resolution_clock::now();
 
-                // Pinned host buffers are used for both the baseline and
-                // compressed paths to keep transfer conditions comparable.
-                int* host_in_ints = nullptr;
-                int* host_out_ints = nullptr;
+            double comp_ms = std::chrono::duration<double, std::milli>(end - start).count();
+            double comp_gbps = (bytes / 1e9) / (comp_ms / 1000.0);
 
-                CUDA_CHECK(
-                    cudaMallocHost(
-                        &host_in_ints,
-                        total_bytes
-                    )
-                );
+            // Compare end-to-end effective throughput of the two paths.
+            std::string winner = (comp_gbps > base_gbps) ? "COMP" : "BASE";
 
-                CUDA_CHECK(
-                    cudaMallocHost(
-                        &host_out_ints,
-                        total_bytes
-                    )
-                );
+            if (winner == "COMP") std::cout << "\033[32m";
+            else std::cout << "\033[31m";
 
+            std::cout << std::setw(6) << mb
+                      << std::setw(8) << run_len
+                      << std::setw(14) << std::setprecision(3) << base_gbps
+                      << std::setw(14) << comp_gbps
+                      << std::setw(10) << winner
+                      << "\n";
 
-                fill_input(
-                    host_in_ints,
-                    n_ints,
-                    mode
-                );
+            std::cout << "\033[0m";
 
-
-                const char* host_in_bytes =
-                    reinterpret_cast<const char*>(
-                        host_in_ints
-                    );
-
-
-                // Compress the complete input once on the CPU. This cost
-                // is reported separately and is not included in the repeated
-                // compressed GPU-pipeline measurements.
-                auto comp_once_start =
-                    std::chrono::high_resolution_clock::now();
-
-
-                // Metadata is retained per chunk because nvCOMP performs
-                // decompression through its batched LZ4 interface.
-                std::vector<size_t> host_uncomp_sizes(num_chunks);
-                std::vector<size_t> host_comp_sizes(num_chunks);
-                std::vector<size_t> host_comp_offsets(num_chunks);
-
-                std::vector<std::vector<char>>
-                    host_comp_chunks(num_chunks);
-
-                size_t total_comp_bytes = 0;
-
-
-                // Compress each 4 MB region independently on the CPU.
-                for (size_t c = 0; c < num_chunks; ++c) {
-
-                    const size_t offset =
-                        c * chunk_size;
-
-                    const size_t this_uncomp_size =
-                        std::min(
-                            chunk_size,
-                            total_bytes - offset
-                        );
-
-                    host_uncomp_sizes[c] =
-                        this_uncomp_size;
-
-
-                    const int max_comp_size =
-                        LZ4_compressBound(
-                            static_cast<int>(
-                                this_uncomp_size
-                            )
-                        );
-
-
-                    host_comp_chunks[c].resize(
-                        static_cast<size_t>(
-                            max_comp_size
-                        )
-                    );
-
-
-                    const int comp_size =
-                        LZ4_compress_default(
-                            host_in_bytes + offset,
-                            host_comp_chunks[c].data(),
-                            static_cast<int>(
-                                this_uncomp_size
-                            ),
-                            max_comp_size
-                        );
-
-
-                    if (comp_size <= 0) {
-                        throw std::runtime_error(
-                            "LZ4 compression failed."
-                        );
-                    }
-
-
-                    host_comp_sizes[c] =
-                        static_cast<size_t>(
-                            comp_size
-                        );
-
-                    host_comp_offsets[c] =
-                        total_comp_bytes;
-
-                    total_comp_bytes +=
-                        static_cast<size_t>(
-                            comp_size
-                        );
-                }
-
-
-                // Flatten the individually compressed chunks so that the
-                // compressed representation can be transferred contiguously.
-                std::vector<char> host_comp_flat(
-                    total_comp_bytes
-                );
-
-                for (size_t c = 0; c < num_chunks; ++c) {
-
-                    std::memcpy(
-                        host_comp_flat.data() +
-                            host_comp_offsets[c],
-
-                        host_comp_chunks[c].data(),
-
-                        host_comp_sizes[c]
-                    );
-                }
-
-
-                auto comp_once_end =
-                    std::chrono::high_resolution_clock::now();
-
-
-                const double cpu_comp_once_ms =
-                    ms_between(
-                        comp_once_start,
-                        comp_once_end
-                    );
-
-
-                // Existing output field "Ratio" stores the percentage
-                // reduction in size rather than original/compressed ratio.
-                const double comp_ratio =
-                    std::max(
-                        0.0,
-                        (
-                            1.0 -
-                            static_cast<double>(
-                                total_comp_bytes
-                            ) /
-                            static_cast<double>(
-                                total_bytes
-                            )
-                        ) * 100.0
-                    );
-
-
-                // Device storage for the uncompressed baseline, compressed
-                // representation, decompressed data, and nvCOMP metadata.
-                int* d_base = nullptr;
-
-                char* d_comp_flat = nullptr;
-                char* d_decomp_flat = nullptr;
-
-                void** d_comp_ptrs = nullptr;
-                void** d_decomp_ptrs = nullptr;
-
-                size_t* d_comp_sizes = nullptr;
-                size_t* d_uncomp_sizes = nullptr;
-                size_t* d_actual_uncomp_sizes = nullptr;
-
-                nvcompStatus_t* d_statuses = nullptr;
-
-                void* d_temp = nullptr;
-
-
-                CUDA_CHECK(
-                    cudaMalloc(
-                        &d_base,
-                        total_bytes
-                    )
-                );
-
-                CUDA_CHECK(
-                    cudaMalloc(
-                        &d_comp_flat,
-                        total_comp_bytes
-                    )
-                );
-
-                CUDA_CHECK(
-                    cudaMalloc(
-                        &d_decomp_flat,
-                        total_bytes
-                    )
-                );
-
-
-                CUDA_CHECK(
-                    cudaMalloc(
-                        &d_comp_ptrs,
-                        num_chunks * sizeof(void*)
-                    )
-                );
-
-                CUDA_CHECK(
-                    cudaMalloc(
-                        &d_decomp_ptrs,
-                        num_chunks * sizeof(void*)
-                    )
-                );
-
-
-                CUDA_CHECK(
-                    cudaMalloc(
-                        &d_comp_sizes,
-                        num_chunks * sizeof(size_t)
-                    )
-                );
-
-                CUDA_CHECK(
-                    cudaMalloc(
-                        &d_uncomp_sizes,
-                        num_chunks * sizeof(size_t)
-                    )
-                );
-
-                CUDA_CHECK(
-                    cudaMalloc(
-                        &d_actual_uncomp_sizes,
-                        num_chunks * sizeof(size_t)
-                    )
-                );
-
-
-                CUDA_CHECK(
-                    cudaMalloc(
-                        &d_statuses,
-                        num_chunks *
-                            sizeof(nvcompStatus_t)
-                    )
-                );
-
-
-                // Build the host-side pointer arrays that describe where
-                // every compressed and decompressed chunk resides on the GPU.
-                std::vector<void*> host_d_comp_ptrs(
-                    num_chunks
-                );
-
-                std::vector<void*> host_d_decomp_ptrs(
-                    num_chunks
-                );
-
-
-                for (size_t c = 0; c < num_chunks; ++c) {
-
-                    host_d_comp_ptrs[c] =
-                        d_comp_flat +
-                        host_comp_offsets[c];
-
-                    host_d_decomp_ptrs[c] =
-                        d_decomp_flat +
-                        c * chunk_size;
-                }
-
-
-                // Transfer nvCOMP's pointer and size metadata once before
-                // entering the repeated benchmark loops.
-                CUDA_CHECK(
-                    cudaMemcpy(
-                        d_comp_ptrs,
-                        host_d_comp_ptrs.data(),
-                        num_chunks * sizeof(void*),
-                        cudaMemcpyHostToDevice
-                    )
-                );
-
-
-                CUDA_CHECK(
-                    cudaMemcpy(
-                        d_decomp_ptrs,
-                        host_d_decomp_ptrs.data(),
-                        num_chunks * sizeof(void*),
-                        cudaMemcpyHostToDevice
-                    )
-                );
-
-
-                CUDA_CHECK(
-                    cudaMemcpy(
-                        d_comp_sizes,
-                        host_comp_sizes.data(),
-                        num_chunks * sizeof(size_t),
-                        cudaMemcpyHostToDevice
-                    )
-                );
-
-
-                CUDA_CHECK(
-                    cudaMemcpy(
-                        d_uncomp_sizes,
-                        host_uncomp_sizes.data(),
-                        num_chunks * sizeof(size_t),
-                        cudaMemcpyHostToDevice
-                    )
-                );
-
-
-                // Query the temporary workspace required by batched
-                // nvCOMP LZ4 decompression.
-                size_t temp_bytes = 0;
-
-                const nvcompBatchedLZ4DecompressOpts_t opts =
-                    nvcompBatchedLZ4DecompressDefaultOpts;
-
-
-                NVCOMP_CHECK(
-                    nvcompBatchedLZ4DecompressGetTempSizeSync(
-                        (const void* const* const)
-                            d_comp_ptrs,
-
-                        d_comp_sizes,
-
-                        num_chunks,
-
-                        chunk_size,
-
-                        &temp_bytes,
-
-                        total_bytes,
-
-                        opts,
-
-                        d_statuses,
-
-                        stream
-                    )
-                );
-
-
-                CUDA_CHECK(
-                    cudaMalloc(
-                        &d_temp,
-                        temp_bytes
-                    )
-                );
-
-
-                // Baseline:
-                // uncompressed H2D -> GPU compute -> uncompressed D2H.
-                std::vector<double> base_ms_runs;
-                std::vector<double> base_gbps_runs;
-
-
-                for (int it = 0;
-                     it < warmup + iterations;
-                     ++it) {
-
-                    auto t0 =
-                        std::chrono::high_resolution_clock::now();
-
-
-                    CUDA_CHECK(
-                        cudaMemcpyAsync(
-                            d_base,
-                            host_in_ints,
-                            total_bytes,
-                            cudaMemcpyHostToDevice,
-                            stream
-                        )
-                    );
-
-
-                    compute_kernel<<<
-                        static_cast<int>(
-                            (n_ints + 255) / 256
-                        ),
-                        256,
-                        0,
-                        stream
-                    >>>(
-                        d_base,
-                        static_cast<int>(
-                            n_ints
-                        )
-                    );
-
-
-                    CUDA_CHECK(
-                        cudaGetLastError()
-                    );
-
-
-                    CUDA_CHECK(
-                        cudaMemcpyAsync(
-                            host_out_ints,
-                            d_base,
-                            total_bytes,
-                            cudaMemcpyDeviceToHost,
-                            stream
-                        )
-                    );
-
-
-                    // Synchronization closes the end-to-end baseline
-                    // measurement only after all queued work has completed.
-                    CUDA_CHECK(
-                        cudaStreamSynchronize(
-                            stream
-                        )
-                    );
-
-
-                    auto t1 =
-                        std::chrono::high_resolution_clock::now();
-
-
-                    if (it >= warmup) {
-
-                        const double base_ms_run =
-                            ms_between(
-                                t0,
-                                t1
-                            );
-
-                        const double base_gbps_run =
-                            total_gib /
-                            (base_ms_run / 1000.0);
-
-
-                        base_ms_runs.push_back(
-                            base_ms_run
-                        );
-
-                        base_gbps_runs.push_back(
-                            base_gbps_run
-                        );
-                    }
-                }
-
-
-                const double base_ms =
-                    mean(base_ms_runs);
-
-                const double base_ms_stddev =
-                    stddev_sample(
-                        base_ms_runs
-                    );
-
-                const double base_gbps =
-                    mean(base_gbps_runs);
-
-                const double base_gbps_stddev =
-                    stddev_sample(
-                        base_gbps_runs
-                    );
-
-
-                // Collect both end-to-end and stage-level measurements
-                // for the compressed processing path.
-                std::vector<double> h2d_ms_runs;
-                std::vector<double> decomp_ms_runs;
-                std::vector<double> kernel_ms_runs;
-                std::vector<double> d2h_ms_runs;
-
-                std::vector<double> pipe_ms_runs;
-
-                std::vector<double>
-                    pipe_phys_gbps_runs;
-
-                std::vector<double>
-                    pipe_eff_gbps_runs;
-
-
-                // Compressed path:
-                // compressed H2D -> GPU decompression -> GPU compute
-                // -> uncompressed D2H.
-                for (int it = 0;
-                     it < warmup + iterations;
-                     ++it) {
-
-                    auto total_start =
-                        std::chrono::high_resolution_clock::now();
-
-
-                    // Measure transfer of the compressed representation.
-                    auto h2d_start =
-                        std::chrono::high_resolution_clock::now();
-
-
-                    CUDA_CHECK(
-                        cudaMemcpyAsync(
-                            d_comp_flat,
-                            host_comp_flat.data(),
-                            total_comp_bytes,
-                            cudaMemcpyHostToDevice,
-                            stream
-                        )
-                    );
-
-
-                    CUDA_CHECK(
-                        cudaStreamSynchronize(
-                            stream
-                        )
-                    );
-
-
-                    auto h2d_end =
-                        std::chrono::high_resolution_clock::now();
-
-
-                    // The decompression stage includes nvCOMP's decompressed
-                    // size query followed by the actual batched decompression.
-                    auto decomp_start =
-                        std::chrono::high_resolution_clock::now();
-
-
-                    NVCOMP_CHECK(
-                        nvcompBatchedLZ4GetDecompressSizeAsync(
-                            (const void* const*)
-                                d_comp_ptrs,
-
-                            d_comp_sizes,
-
-                            d_uncomp_sizes,
-
-                            num_chunks,
-
-                            stream
-                        )
-                    );
-
-
-                    CUDA_CHECK(
-                        cudaStreamSynchronize(
-                            stream
-                        )
-                    );
-
-
-                    NVCOMP_CHECK(
-                        nvcompBatchedLZ4DecompressAsync(
-                            (const void* const*)
-                                d_comp_ptrs,
-
-                            d_comp_sizes,
-
-                            d_uncomp_sizes,
-
-                            d_actual_uncomp_sizes,
-
-                            num_chunks,
-
-                            d_temp,
-
-                            temp_bytes,
-
-                            d_decomp_ptrs,
-
-                            opts,
-
-                            d_statuses,
-
-                            stream
-                        )
-                    );
-
-
-                    CUDA_CHECK(
-                        cudaStreamSynchronize(
-                            stream
-                        )
-                    );
-
-
-                    auto decomp_end =
-                        std::chrono::high_resolution_clock::now();
-
-
-                    // Execute the same device-side computation used by
-                    // the uncompressed baseline.
-                    auto kernel_start =
-                        std::chrono::high_resolution_clock::now();
-
-
-                    compute_kernel<<<
-                        static_cast<int>(
-                            (n_ints + 255) / 256
-                        ),
-                        256,
-                        0,
-                        stream
-                    >>>(
-                        reinterpret_cast<int*>(
-                            d_decomp_flat
-                        ),
-                        static_cast<int>(
-                            n_ints
-                        )
-                    );
-
-
-                    CUDA_CHECK(
-                        cudaGetLastError()
-                    );
-
-
-                    CUDA_CHECK(
-                        cudaStreamSynchronize(
-                            stream
-                        )
-                    );
-
-
-                    auto kernel_end =
-                        std::chrono::high_resolution_clock::now();
-
-
-                    // Return the processed, uncompressed output to the host.
-                    auto d2h_start =
-                        std::chrono::high_resolution_clock::now();
-
-
-                    CUDA_CHECK(
-                        cudaMemcpyAsync(
-                            host_out_ints,
-                            d_decomp_flat,
-                            total_bytes,
-                            cudaMemcpyDeviceToHost,
-                            stream
-                        )
-                    );
-
-
-                    CUDA_CHECK(
-                        cudaStreamSynchronize(
-                            stream
-                        )
-                    );
-
-
-                    auto d2h_end =
-                        std::chrono::high_resolution_clock::now();
-
-                    auto total_end =
-                        std::chrono::high_resolution_clock::now();
-
-
-                    // Warm-up measurements are intentionally discarded.
-                    if (it >= warmup) {
-
-                        const int run_id =
-                            it - warmup + 1;
-
-
-                        const double h2d_ms_run =
-                            ms_between(
-                                h2d_start,
-                                h2d_end
-                            );
-
-                        const double decomp_ms_run =
-                            ms_between(
-                                decomp_start,
-                                decomp_end
-                            );
-
-                        const double kernel_ms_run =
-                            ms_between(
-                                kernel_start,
-                                kernel_end
-                            );
-
-                        const double d2h_ms_run =
-                            ms_between(
-                                d2h_start,
-                                d2h_end
-                            );
-
-                        const double pipe_ms_run =
-                            ms_between(
-                                total_start,
-                                total_end
-                            );
-
-
-                        // Physical throughput reflects the number of compressed
-                        // bytes entering the pipeline.
-                        const double pipe_phys_gbps_run =
-                            bytes_to_gib(
-                                total_comp_bytes
-                            ) /
-                            (pipe_ms_run / 1000.0);
-
-
-                        // Effective throughput normalizes the same execution
-                        // time by the original logical input size.
-                        const double pipe_eff_gbps_run =
-                            total_gib /
-                            (pipe_ms_run / 1000.0);
-
-
-                        h2d_ms_runs.push_back(
-                            h2d_ms_run
-                        );
-
-                        decomp_ms_runs.push_back(
-                            decomp_ms_run
-                        );
-
-                        kernel_ms_runs.push_back(
-                            kernel_ms_run
-                        );
-
-                        d2h_ms_runs.push_back(
-                            d2h_ms_run
-                        );
-
-                        pipe_ms_runs.push_back(
-                            pipe_ms_run
-                        );
-
-                        pipe_phys_gbps_runs.push_back(
-                            pipe_phys_gbps_run
-                        );
-
-                        pipe_eff_gbps_runs.push_back(
-                            pipe_eff_gbps_run
-                        );
-
-
-                        // Pair each compressed-pipeline run with the
-                        // corresponding measured baseline run.
-                        detail_csv
-                            << mode_to_string(mode)
-                            << ","
-
-                            << mb
-                            << ","
-
-                            << run_id
-                            << ","
-
-                            << base_ms_runs[
-                                   run_id - 1
-                               ]
-                            << ","
-
-                            << base_gbps_runs[
-                                   run_id - 1
-                               ]
-                            << ","
-
-                            << pipe_ms_run
-                            << ","
-
-                            << pipe_phys_gbps_run
-                            << ","
-
-                            << pipe_eff_gbps_run
-                            << ","
-
-                            << h2d_ms_run
-                            << ","
-
-                            << decomp_ms_run
-                            << ","
-
-                            << kernel_ms_run
-                            << ","
-
-                            << d2h_ms_run
-                            << "\n";
-                    }
-                }
-
-
-                // Aggregate stage-level and end-to-end measurements over
-                // the timed iterations.
-                const double avg_h2d_ms =
-                    mean(h2d_ms_runs);
-
-                const double avg_decomp_ms =
-                    mean(decomp_ms_runs);
-
-                const double avg_kernel_ms =
-                    mean(kernel_ms_runs);
-
-                const double avg_d2h_ms =
-                    mean(d2h_ms_runs);
-
-
-                const double avg_pipe_ms =
-                    mean(pipe_ms_runs);
-
-                const double pipe_ms_stddev =
-                    stddev_sample(
-                        pipe_ms_runs
-                    );
-
-
-                const double pipe_phys_gbps =
-                    mean(
-                        pipe_phys_gbps_runs
-                    );
-
-                const double pipe_phys_gbps_stddev =
-                    stddev_sample(
-                        pipe_phys_gbps_runs
-                    );
-
-
-                const double pipe_eff_gbps =
-                    mean(
-                        pipe_eff_gbps_runs
-                    );
-
-                const double pipe_eff_gbps_stddev =
-                    stddev_sample(
-                        pipe_eff_gbps_runs
-                    );
-
-
-                // Use logical/effective throughput for the direct comparison
-                // with the uncompressed baseline.
-                const std::string winner =
-                    (pipe_eff_gbps > base_gbps)
-                        ? "PIPE"
-                        : "BASE";
-
-
-                // Highlight the faster path in the terminal only.
-                std::cout
-                    << (
-                        winner == "PIPE"
-                            ? "\033[32m"
-                            : "\033[31m"
-                    );
-
-
-                std::cout << std::left
-                          << std::setw(10)
-                          << mode_to_string(mode)
-
-                          << std::setw(8)
-                          << mb
-
-                          << std::setw(10)
-                          << comp_ratio;
-
-
-                std::cout << std::right
-                          << std::setw(7)
-                          << base_gbps
-
-                          << " ± "
-
-                          << std::setw(6)
-                          << base_gbps_stddev
-
-                          << "   ";
-
-
-                std::cout << std::setw(7)
-                          << pipe_phys_gbps
-
-                          << " ± "
-
-                          << std::setw(6)
-                          << pipe_phys_gbps_stddev
-
-                          << "   ";
-
-
-                std::cout << std::setw(7)
-                          << pipe_eff_gbps
-
-                          << " ± "
-
-                          << std::setw(6)
-                          << pipe_eff_gbps_stddev
-
-                          << "   ";
-
-
-                std::cout << std::left
-                          << std::setw(10)
-                          << winner
-                          << "\n";
-
-
-                std::cout << "\033[0m";
-
-
-                // Write the averaged measurements for the current
-                // mode/size combination.
-                csv << mode_to_string(mode)
-                    << ","
-
-                    << mb
-                    << ","
-
-                    << comp_ratio
-                    << ","
-
-                    << base_gbps
-                    << ","
-
-                    << base_gbps_stddev
-                    << ","
-
-                    << pipe_phys_gbps
-                    << ","
-
-                    << pipe_phys_gbps_stddev
-                    << ","
-
-                    << pipe_eff_gbps
-                    << ","
-
-                    << pipe_eff_gbps_stddev
-                    << ","
-
-                    << base_ms
-                    << ","
-
-                    << base_ms_stddev
-                    << ","
-
-                    << cpu_comp_once_ms
-                    << ","
-
-                    << avg_h2d_ms
-                    << ","
-
-                    << avg_decomp_ms
-                    << ","
-
-                    << avg_kernel_ms
-                    << ","
-
-                    << avg_d2h_ms
-                    << ","
-
-                    << avg_pipe_ms
-                    << ","
-
-                    << pipe_ms_stddev
-                    << ","
-
-                    << winner
-                    << "\n";
-
-
-                // All allocations are local to this mode/size experiment
-                // and are released before moving to the next configuration.
-                CUDA_CHECK(cudaFree(d_base));
-
-                CUDA_CHECK(cudaFree(d_comp_flat));
-
-                CUDA_CHECK(cudaFree(d_decomp_flat));
-
-                CUDA_CHECK(cudaFree(d_comp_ptrs));
-
-                CUDA_CHECK(cudaFree(d_decomp_ptrs));
-
-                CUDA_CHECK(cudaFree(d_comp_sizes));
-
-                CUDA_CHECK(cudaFree(d_uncomp_sizes));
-
-                CUDA_CHECK(
-                    cudaFree(
-                        d_actual_uncomp_sizes
-                    )
-                );
-
-                CUDA_CHECK(cudaFree(d_statuses));
-
-                CUDA_CHECK(cudaFree(d_temp));
-
-                CUDA_CHECK(
-                    cudaFreeHost(
-                        host_in_ints
-                    )
-                );
-
-                CUDA_CHECK(
-                    cudaFreeHost(
-                        host_out_ints
-                    )
-                );
-            }
+            cudaFree(d_comp);
+            cudaFree(d_data);
         }
 
-
-        // Finalize result files and release the shared CUDA stream.
-        csv.close();
-        detail_csv.close();
-
-        CUDA_CHECK(
-            cudaStreamDestroy(
-                stream
-            )
-        );
-
-        return 0;
+        std::cout << "-------------------------------------------------------------\n";
     }
 
-    catch (const std::exception& e) {
-
-        std::cerr
-            << "Exception: "
-            << e.what()
-            << std::endl;
-
-        return 1;
-    }
+    return 0;
 }
 
-// Build and run:
+// Build:
+// mkdir -p bin
+// nvcc -O2 src/benchmark/simple_pipeline.cu -o bin/simple_pipeline
 //
-// nvcc -std=c++17 -O3 \
-//   -I ~/nvcomp_env/lib/python3.12/site-packages/nvidia/libnvcomp/include \
-//   src/benchmark/simple_pipeline.cu \
-//   -L ~/nvcomp_env/lib/python3.12/site-packages/nvidia/libnvcomp/lib64 \
-//   -lnvcomp -llz4 \
-//   -o bin/simple_pipeline
-
-// export LD_LIBRARY_PATH=$HOME/nvcomp_env/lib/python3.12/site-packages/nvidia/libnvcomp/lib64:$LD_LIBRARY_PATH
-
+// Run:
 // ./bin/simple_pipeline
-

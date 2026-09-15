@@ -458,7 +458,7 @@ The CPU side uses multiple worker threads for CPU-assigned chunks.
 The primary LZ4/nvCOMP experiments use:
 
 ```text
-Chunk size:       512 KiB
+Chunk size:       1 MiB
 Compression:      LZ4_HC
 Compression level: 8
 GPU batch size:   768 chunks
@@ -717,7 +717,7 @@ docs/fused_dpf_goda.txt
 ```bash
 mkdir -p bin
 
-nvcc -O3 -std=c++17 -arch=sm_86 \
+nvcc -O3 -std=c++17 -arch=sm_86 -Xcompiler -pthread \
   src/benchmark/spja_dpf_fused_x40.cu \
   -o bin/spja_dpf_fused_x40
 ```
@@ -731,7 +731,7 @@ Run:
 For the string/categorical variant:
 
 ```bash
-nvcc -O3 -std=c++17 -arch=sm_86 \
+nvcc -O3 -std=c++17 -arch=sm_86 -Xcompiler -pthread \
   src/benchmark/spja_dpf_fused_x40_strings.cu \
   -o bin/spja_dpf_fused_x40_strings
 ```
@@ -972,7 +972,7 @@ bash scripts/run_fastlanes_spja_x40_strings.sh
 ### Step 11: Compile and Run DPF-Inspired Baseline
 
 ```bash
-nvcc -O3 -std=c++17 -arch=sm_86 \
+nvcc -O3 -std=c++17 -arch=sm_86 -Xcompiler -pthread \
   src/benchmark/spja_dpf_fused_x40.cu \
   -o bin/spja_dpf_fused_x40
 

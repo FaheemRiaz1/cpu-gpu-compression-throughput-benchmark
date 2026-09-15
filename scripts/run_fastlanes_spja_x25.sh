@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 set -e
 
-cd ~/gpu_benchmark_clean
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$REPO_ROOT"
 
 echo "Building FastLanes SPJA x25 co-processor benchmark..."
 
@@ -21,7 +23,7 @@ $(cat "$INCLUDES") \
 
 cd build/baseline/fastlanes_gpu
 bash CMakeFiles/fastlanes_gpu_aggregate.dir/link.txt
-cd ~/gpu_benchmark_clean
+cd "$REPO_ROOT"
 
 echo "Running FastLanes SPJA x25 co-processor benchmark..."
 

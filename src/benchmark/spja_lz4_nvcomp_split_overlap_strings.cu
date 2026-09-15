@@ -1108,7 +1108,7 @@ int main() {
 
         metadata << "Benchmark metadata\n";
         metadata << "==================\n";
-        metadata << "Dataset: official tpch-dbgen SF=1\n";
+        metadata << "Dataset: TPC-H SF1-derived x40 string workload\n";
         metadata << "Input format: converted .tbl files to binary int32 columns\n";
         metadata << "Columns: orderkey, quantity, extendedprice\n";
         metadata << "Query: LINEITEM + ORDERS + CUSTOMER using orderkey -> custkey -> customer_mktsegment\n";

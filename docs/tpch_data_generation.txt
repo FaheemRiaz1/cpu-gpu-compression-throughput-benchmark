@@ -175,6 +175,39 @@ It provides enough data for the CPU and GPU to execute
 substantial portions of the workload concurrently.
 
 ============================================================
+Reproducing the SPJA x40 Workload
+============================================================
+
+The final SPJA experiments use an x40 workload derived from the
+prepared TPC-H SF1 columnar data.
+
+The base TPC-H tables are first converted to binary column files with:
+
+tools/convert_required_tpch_to_binary.py
+
+The x40 workload is then produced from these prepared binary columns
+while preserving the original row order, value representation, and
+logical SPJA relationships.
+
+The final integer-workload files expected by the benchmarks are:
+
+data/tpch_columnar/orderkey_sfx40.bin
+data/tpch_columnar/quantity_sfx40.bin
+data/tpch_columnar/extendedprice_sfx40.bin
+data/tpch_columnar/order_custkey_sfx40.bin
+data/tpch_columnar/customer_nation_sfx40.bin
+
+The x40 fact workload contains 240,048,600 LINEITEM-derived rows.
+
+Generated x40 binary files are intentionally excluded from Git because
+of their size. The benchmark therefore expects these files to be
+prepared locally before execution.
+
+The x40 preparation step does not change the binary element type or
+the ordering within the source columns; it only scales the prepared
+TPC-H-derived workload used by the benchmark.
+
+============================================================
 LZ4 Input Preparation
 ============================================================
 
@@ -183,7 +216,7 @@ into independently compressed chunks.
 
 Main chunk size:
 
-512 KiB
+1 MiB
 
 Compression algorithm:
 
@@ -207,7 +240,7 @@ decompression.
 
 The main thesis configuration uses a GPU batch size of:
 
-120 chunks
+768 chunks
 
 The batched design allows multiple compressed chunks to be
 processed by nvCOMP in parallel.

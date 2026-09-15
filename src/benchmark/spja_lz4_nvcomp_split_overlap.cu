@@ -849,9 +849,9 @@ int main() {
             "data/tpch_columnar/part_factor_sf1.bin";
 
         // Compression, batching, repetition, and assignment parameters.
-        const size_t chunk_bytes = 1ULL << 20;   // 1MB chunks for official SF=1
-        const size_t chunk_rows = chunk_bytes / sizeof(int);
-        const size_t gpu_batch_chunks = 768 ;      // one GPU batch for SF=1-sized input
+        const size_t chunk_bytes = 1ULL << 20;   // 1 MiB chunks for the primary x40 workload
+        const size_t chunk_rows = chunk_bytes / sizeof(int);q
+        const size_t gpu_batch_chunks = 768 ;      // maximum chunks processed per GPU batch
 
         const int lz4_hc_level = 8;
         const int warmup = 5;
@@ -1100,7 +1100,7 @@ int main() {
 
         metadata << "Benchmark metadata\n";
         metadata << "==================\n";
-        metadata << "Dataset: official tpch-dbgen SF=1\n";
+        metadata << "Dataset: official tpch-dbgen SF1-derived x40 workload\n\n";
         metadata << "Input format: converted .tbl files to binary int32 columns\n";
         metadata << "Columns: orderkey, quantity, extendedprice\n";
         metadata << "Query: LINEITEM + ORDERS + CUSTOMER using orderkey -> custkey -> nation\n";

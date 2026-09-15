@@ -1984,7 +1984,7 @@ int main()
 
     comparison_csv
         << "Dataset,Layout,System,Avg_ms,Throughput_GBps,"
-        << "Compression_or_Encoding,Reduction_Percent,Status,Source";
+        << "Compression_or_Encoding,Reduction_Percent,Status,Source\n";
 
 
     comparison_csv
@@ -1994,7 +1994,7 @@ int main()
         << nvcomp_original_gbps
         << ",LZ4_HC_level_6,"
         << nvcomp_original_reduction
-        << ",OK,previous original-order SF10 run";
+        << ",OK,previous original-order SF10 run\n";
 
 
     comparison_csv
@@ -2002,7 +2002,7 @@ int main()
         << fastlanes_original_ms
         << ","
         << fastlanes_original_gbps
-        << ",packed,,OK,previous original-order SF10 FastLanes run";
+        << ",packed,,OK,previous original-order SF10 FastLanes run\n";
 
 
     comparison_csv

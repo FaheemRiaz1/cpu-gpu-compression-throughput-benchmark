@@ -143,3 +143,7 @@ external/baseline/fastlanes_gpu/*
 !external/baseline/fastlanes_gpu/coproc_fastlanes.cu
 !external/baseline/fastlanes_gpu/spja_coproc_fastlanes.cu
 !external/baseline/fastlanes_gpu/spja_coproc_fastlanes_strings.cu
+
+# Duplicate SF20 graphs identical to SF10 outputs
+/results/sf20_graphs/cpu_gpu_throughput_line_sf20.png
+/results/sf20_graphs/cpu_vs_gpu_sf20.png
