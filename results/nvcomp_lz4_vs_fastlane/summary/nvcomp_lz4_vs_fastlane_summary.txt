@@ -1,0 +1,18 @@
+nvCOMP LZ4 vs FastLanes-GPU Baseline Comparison
+================================================
+GPU: NVIDIA RTX A2000 12GB
+Experiment: sorted_sf10_quantity_repeated_23x_5gib
+Input: data/baseline_quantity_sf10_sorted_lz4best_repeated/quantity_sf10_sorted_lz4best_repeated_23x_5gib.bin
+Rows: 929693696
+Input MiB: 3546.5
+Compressed MiB: 13.9992
+Compression reduction %: 99.6053
+nvCOMP decompression-only avg ms: 15.5928
+nvCOMP decompression-only GB/s: 238.493
+nvCOMP decompression+SUM avg ms: 29.4719
+nvCOMP decompression+SUM GB/s: 126.18
+FastLanes 23x benchmark file: results/baseline_fastlanes_gpu/quantity_sf10_sorted_lz4best_5gib/fastlanes_gpu/decompress_benchmark.txt
+FastLanes 23x status: MISSING
+FastLanes 45x/10GiB status: FAILED: CUDA out-of-memory / illegal memory access on RTX A2000 12GB
+SUM match: YES
+Exact byte/int match: YES

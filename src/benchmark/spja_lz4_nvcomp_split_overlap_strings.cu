@@ -18,18 +18,14 @@
 #include <lz4hc.h>
 #include <nvcomp/lz4.h>
 
-// ------------------------------------------------------------
-// Output colors
-// ------------------------------------------------------------
+// Terminal colors used only to make split comparisons easier to read.
 const std::string RED   = "\033[31m";
 const std::string GREEN = "\033[32m";
 const std::string BLUE  = "\033[34m";
 const std::string RESET = "\033[0m";
 
-// ------------------------------------------------------------
-// Output files
-// Main CSV filename is intentionally kept unchanged.
-// ------------------------------------------------------------
+// Benchmark output artifacts. The main CSV path is kept stable for
+// compatibility with existing analysis and plotting scripts.
 const std::string MAIN_CSV_PATH =
     "results/spja_workload/csv/spja_lz4_nvcomp_hybrid_split_overlap_strings_results.csv";
 
@@ -45,9 +41,7 @@ const std::string METADATA_PATH =
 const std::string SUMMARY_PATH =
     "results/spja_workload/csv/spja_lz4_nvcomp_strings_summary.txt";
 
-// ------------------------------------------------------------
-// Basic error checking helpers
-// ------------------------------------------------------------
+// Fail fast on CUDA and nvCOMP errors and report the source location.
 inline void cuda_check(cudaError_t e, const char* file, int line) {
     if (e != cudaSuccess) {
         std::cerr << "CUDA error: " << cudaGetErrorString(e)
@@ -67,9 +61,7 @@ inline void nvcomp_check(nvcompStatus_t s, const char* file, int line) {
 #define CUDA_CHECK(x) cuda_check((x), __FILE__, __LINE__)
 #define NVCOMP_CHECK(x) nvcomp_check((x), __FILE__, __LINE__)
 
-// ------------------------------------------------------------
-// Small utility functions
-// ------------------------------------------------------------
+// Timing, statistics, byte conversion, and binary-column helpers.
 template <typename T1, typename T2>
 double ms_between(const T1& a, const T2& b) {
     return std::chrono::duration<double, std::milli>(b - a).count();
@@ -156,9 +148,8 @@ static std::vector<int> read_int_column(const std::string& path) {
     return values;
 }
 
-// ------------------------------------------------------------
-// CPU SPJA query. Used for CPU-owned chunks and correctness check.
-// ------------------------------------------------------------
+// CPU implementation of the SPJA query. It is used for CPU-owned chunks
+// and for the independent reference result used in correctness checks.
 static unsigned long long spja_cpu_columnar(
     const int* orderkey,
     const int* quantity,
@@ -194,9 +185,8 @@ static unsigned long long spja_cpu_columnar(
 
     return sum;
 }
-// ------------------------------------------------------------
-// GPU query kernel. Each block produces one partial aggregate.
-// ------------------------------------------------------------
+// GPU SPJA kernel. Each thread evaluates one row and each CUDA block
+// reduces its qualifying extendedprice values to one partial aggregate.
 __global__ void spja_gpu_columnar_kernel(
     const int* orderkey,
     const int* quantity,
@@ -247,9 +237,7 @@ __global__ void spja_gpu_columnar_kernel(
         block_sums[blockIdx.x] = shared_sum[0];
     }
 }
-// ------------------------------------------------------------
-// Reduce block sums into one device-side result.
-// ------------------------------------------------------------
+// Reduce block-level partial aggregates into the final device-side sum.
 __global__ void reduce_block_sums_kernel(
     const unsigned long long* block_sums,
     size_t n_blocks,
@@ -281,9 +269,8 @@ __global__ void reduce_block_sums_kernel(
     }
 }
 
-// ------------------------------------------------------------
-// Chunked compressed representation of one column.
-// ------------------------------------------------------------
+// Chunk-level LZ4 representation retained for independent CPU/GPU
+// decompression and per-column compression statistics.
 struct CompressedColumn {
     std::vector<size_t> uncomp_sizes;
     std::vector<size_t> comp_sizes;
@@ -293,9 +280,8 @@ struct CompressedColumn {
     size_t total_comp_bytes = 0;
 };
 
-// ------------------------------------------------------------
-// Compress one integer column chunk-wise using LZ4_HC.
-// ------------------------------------------------------------
+// Compress one int32 column into independent fixed-size LZ4_HC chunks.
+// This preprocessing step is performed before the timed benchmark region.
 static CompressedColumn compress_column_lz4_hc(
     const int* data,
     size_t n_rows,
@@ -360,9 +346,8 @@ static CompressedColumn compress_column_lz4_hc(
     return out;
 }
 
-// ------------------------------------------------------------
-// GPU batch representation.
-// ------------------------------------------------------------
+// Host-side GPU batch: flattened compressed payload plus the metadata
+// needed to reconstruct the three query columns on the device.
 struct GpuBatch {
     size_t first_chunk = 0;
     size_t num_chunks = 0;
@@ -379,9 +364,7 @@ struct GpuBatch {
     std::vector<size_t> row_offsets;
 };
 
-// ------------------------------------------------------------
-// CUDA events used for per-batch timing.
-// ------------------------------------------------------------
+// CUDA events used to separate H2D, decompression, and query-kernel time.
 struct BatchTimingEvents {
     cudaEvent_t batch_start = nullptr;
     cudaEvent_t h2d_end = nullptr;
@@ -450,10 +433,8 @@ static void destroy_gpu_batch_device_state(GpuBatchDeviceState& st) {
     st.batch_count = 0;
 }
 
-// ------------------------------------------------------------
-// Build a GPU batch from an explicit list of chunk IDs.
-// This supports fair deterministic chunk assignments.
-// ------------------------------------------------------------
+// Build one GPU batch from an explicit list of chunk IDs. Data from all
+// three fact columns is flattened while retaining per-chunk decode metadata.
 static GpuBatch build_gpu_batch_from_chunk_ids(
     const std::vector<size_t>& gpu_chunk_ids,
     size_t first_index,
@@ -533,9 +514,7 @@ static GpuBatch build_gpu_batch_from_chunk_ids(
     return batch;
 }
 
-// ------------------------------------------------------------
-// Greatest common divisor for deterministic fair chunk strides.
-// ------------------------------------------------------------
+// Helpers for deterministic chunk permutations across assignment trials.
 static size_t gcd_size_t(size_t a, size_t b) {
     while (b != 0) {
         const size_t r = a % b;
@@ -546,10 +525,8 @@ static size_t gcd_size_t(size_t a, size_t b) {
     return a;
 }
 
-// ------------------------------------------------------------
-// Pick a stride that is coprime with total_chunks.
-// This creates a full deterministic permutation of chunk IDs.
-// ------------------------------------------------------------
+// Choose a stride that is coprime with the chunk count so repeated modular
+// stepping visits every chunk exactly once.
 static size_t choose_coprime_stride(size_t total_chunks, int trial) {
     const size_t candidates[] = {
         1, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37
@@ -570,11 +547,8 @@ static size_t choose_coprime_stride(size_t total_chunks, int trial) {
     return 1;
 }
 
-// ------------------------------------------------------------
-// Build deterministic fair CPU/GPU chunk assignment.
-// Each trial uses a different full permutation. This avoids
-// relying on one fixed sorted chunk layout.
-// ------------------------------------------------------------
+// Partition chunks between CPU and GPU using a different deterministic
+// permutation per trial, reducing dependence on one physical chunk order.
 static void build_fair_chunk_assignment(
     size_t total_chunks,
     size_t gpu_chunks,
@@ -614,9 +588,8 @@ static void build_fair_chunk_assignment(
 }
 
 
-// ------------------------------------------------------------
-// Multi-threaded CPU processing for CPU-owned chunks.
-// ------------------------------------------------------------
+// Decompress and query CPU-owned chunks in parallel. Stage times are
+// collected per worker while cpu_total_ms records the actual wall time.
 static unsigned long long cpu_process_chunks_multithreaded(
     const std::vector<size_t>& cpu_chunk_ids,
     const CompressedColumn& comp_partkey,
@@ -844,9 +817,7 @@ static unsigned long long cpu_process_chunks_multithreaded(
     return total_sum;
 }
 
-// ------------------------------------------------------------
-// Main benchmark
-// ------------------------------------------------------------
+// Main benchmark driver.
 int main() {
     try {
         CUDA_CHECK(cudaSetDevice(0));
@@ -854,6 +825,8 @@ int main() {
         std::system("mkdir -p bin");
         std::system("mkdir -p results/spja_workload/csv");
 
+        // Input column paths. The active fact-table join key is read from
+        // orderkey_path; some variable names retain earlier prototype naming.
         const std::string partkey_path =
             "data/tpch_columnar/partkey_sf1.bin";
 
@@ -878,15 +851,17 @@ int main() {
         const std::string part_factor_path =
             "data/tpch_columnar/part_factor_sf1.bin";
 
-        const size_t chunk_bytes = 1ULL << 19;   // 512 KiB chunks for official SF=1
+        // Compression, batching, and repetition parameters used by all splits.
+        const size_t chunk_bytes = 1ULL << 19;   // 512 KiB compressed chunks.
         const size_t chunk_rows = chunk_bytes / sizeof(int);
-        const size_t gpu_batch_chunks = 1250 ;      // one GPU batch for SF=1-sized input
+        const size_t gpu_batch_chunks = 1250 ;      // Maximum chunks grouped into one GPU batch.
 
         const int lz4_hc_level = 8;
         const int warmup = 5;
         const int iterations = 5;
         const int assignment_trials = 5;
 
+        // Match the benchmark CPU path to at most 36 hardware threads.
         const unsigned int detected_cpu_threads =
             std::thread::hardware_concurrency();
 
@@ -897,10 +872,13 @@ int main() {
 
         const bool detailed_gpu_stage_timing = true;
 
+        // Standard CPU/GPU split points from CPU-only to GPU-only.
         const std::vector<int> gpu_percents = {
             0, 25, 50, 75, 100
         };
 
+        // Load the three fact columns and the two lookup arrays.
+        // host_partkey is a legacy name; it contains orderkey in this workload.
         std::vector<int> host_partkey =
             read_int_column(orderkey_path);
 
@@ -930,7 +908,7 @@ int main() {
         const int customer_count =
             static_cast<int>(host_customer_mktsegment_code.size());
 
-        const int target_segment = 1; // BUILDING
+        const int target_segment = 1; // Dictionary code for BUILDING.
 
         const size_t total_chunks =
             (n_rows + chunk_rows - 1) / chunk_rows;
@@ -961,6 +939,7 @@ int main() {
         std::cout << "  GPU path optimization: no query/codec/data change; reusable nvCOMP metadata + pinned host compressed transfer + two-stream double buffering\n";
         std::cout << "  Chunk assignment: multiple deterministic fair assignments\n\n";
 
+        // Independent full-CPU result used to validate every measured split.
         const unsigned long long reference_result =
             spja_cpu_columnar(
                 host_partkey.data(),
@@ -974,6 +953,8 @@ int main() {
                 target_segment
             );
 
+        // Compress the three fact columns once before benchmarking.
+        // This preprocessing cost is reported but excluded from timed query runs.
         auto comp_start =
             std::chrono::high_resolution_clock::now();
 
@@ -1089,9 +1070,8 @@ int main() {
                   << std::setw(18) << compression_reduction_percent
                   << "\n\n";
 
-        // ------------------------------------------------------------
-        // Write compression statistics and reproducibility metadata.
-        // ------------------------------------------------------------
+        // Persist compression statistics and the configuration needed to
+        // reproduce the experiment without mixing preprocessing into query time.
         std::ofstream compression_csv(COMPRESSION_CSV_PATH);
 
         compression_csv
@@ -1154,9 +1134,8 @@ int main() {
 
         metadata.close();
 
-        // ------------------------------------------------------------
-        // Main aggregate CSV. Filename is kept unchanged.
-        // ------------------------------------------------------------
+        // Main split-level output: averages and sample standard deviations
+        // aggregated across the deterministic assignment trials.
         std::ofstream csv(MAIN_CSV_PATH);
 
         csv << "Mode,Input_MiB,CPU_Percent,GPU_Percent,"
@@ -1181,9 +1160,7 @@ int main() {
             << "Overlap_Efficiency_Avg,Overlap_Efficiency_StdDev,"
             << "Final_Result,Reference_Result,Valid\n";
 
-        // ------------------------------------------------------------
-        // Detailed CSV. One row per CPU/GPU split and assignment trial.
-        // ------------------------------------------------------------
+        // Detailed output: one averaged row for each split/assignment pair.
         std::ofstream detailed_csv(DETAILED_CSV_PATH);
 
         detailed_csv
@@ -1227,12 +1204,14 @@ int main() {
         std::cout
             << "----------------------------------------------------------------------------------------------------------------------------------------------------------\n";
 
+        // Retain split-level results for the final best-split comparison.
         std::vector<int> summary_cpu_percent;
         std::vector<int> summary_gpu_percent;
         std::vector<double> summary_total_ms;
         std::vector<double> summary_eff_gibps;
         std::vector<bool> summary_valid;
 
+        // Evaluate each split over several deterministic chunk assignments.
         for (int gpu_percent : gpu_percents) {
             const int cpu_percent = 100 - gpu_percent;
 
@@ -1272,6 +1251,7 @@ int main() {
                 std::vector<size_t> cpu_chunk_ids;
                 std::vector<size_t> gpu_chunk_ids;
 
+                // Select disjoint CPU/GPU chunk ownership for this assignment.
                 build_fair_chunk_assignment(
                     total_chunks,
                     gpu_chunks,
@@ -1298,6 +1278,8 @@ int main() {
                     gpu_rows += std::min(chunk_rows, n_rows - start);
                 }
 
+                // Group GPU-owned chunks into bounded batches while preserving
+                // the same logical assignment used by the CPU/GPU comparison.
                 std::vector<GpuBatch> gpu_batches;
 
                 if (!gpu_chunk_ids.empty()) {
@@ -1326,6 +1308,8 @@ int main() {
                     }
                 }
 
+                // Determine the largest batch so reusable buffers can be
+                // allocated once outside the timed iteration loop.
                 size_t max_batch_rows = 0;
                 size_t max_batch_comp_bytes = 0;
                 size_t max_batch_count = 0;
@@ -1341,6 +1325,8 @@ int main() {
                         std::max(max_batch_count, batch.comp_sizes.size());
                 }
 
+                // Two streams and two reusable buffer slots implement
+                // double-buffered GPU processing across batches.
                 const int gpu_buffer_slots = 2;
 
                 cudaStream_t gpu_streams[gpu_buffer_slots] = {
@@ -1351,9 +1337,8 @@ int main() {
                 CUDA_CHECK(cudaStreamCreate(&gpu_streams[0]));
                 CUDA_CHECK(cudaStreamCreate(&gpu_streams[1]));
 
-                // Fallback pinned staging buffer. It is used only if direct
-                // cudaHostRegister() of the already-built compressed batches
-                // is not available on this system.
+                // Fallback pinned staging is used only when the existing
+                // compressed batch buffers cannot be registered directly.
                 char* h_pinned_comp[gpu_buffer_slots] = {
                     nullptr,
                     nullptr
@@ -1403,10 +1388,8 @@ int main() {
                 size_t temp_bytes = 0;
 
                 if (!gpu_chunk_ids.empty()) {
-                    // Try to pin the existing compressed batch buffers directly.
-                    // This removes the extra host memcpy from std::vector ->
-                    // pinned staging memory in the timed loop, while keeping the
-                    // exact same H2D compressed transfer in the benchmark path.
+                    // Register the existing compressed buffers when possible so the
+                    // timed path transfers them directly without an extra host copy.
                     use_registered_batch_host_memory = true;
                     registered_host_buffers.reserve(gpu_batches.size());
 
@@ -1427,7 +1410,7 @@ int main() {
                                 << cudaGetErrorString(reg_status)
                                 << "). Falling back to pinned staging buffers.\n";
 
-                            // Clear any pending runtime error state before continuing.
+                            // Clear the failed registration status before using the fallback.
                             cudaGetLastError();
                             use_registered_batch_host_memory = false;
                             break;
@@ -1501,6 +1484,8 @@ int main() {
                         sizeof(unsigned long long)
                     ));
 
+                    // Lookup arrays are copied once per assignment and kept
+                    // resident throughout its warm-up and measured iterations.
                     CUDA_CHECK(cudaMemcpyAsync(
                         d_order_custkey,
                         host_order_custkey.data(),
@@ -1522,6 +1507,8 @@ int main() {
                     const nvcompBatchedLZ4DecompressOpts_t opts =
                         nvcompBatchedLZ4DecompressDefaultOpts;
 
+                    // Build nvCOMP pointer/size metadata for every slot and batch
+                    // before timing so setup overhead is not repeated per query.
                     gpu_batch_states_by_slot.resize(
                         static_cast<size_t>(gpu_buffer_slots)
                     );
@@ -1656,6 +1643,7 @@ int main() {
                     }
                 }
 
+                // Measurement vectors contain only post-warm-up iterations.
                 std::vector<double> cpu_decomp_ms_runs;
                 std::vector<double> cpu_spja_ms_runs;
                 std::vector<double> cpu_total_ms_runs;
@@ -1676,6 +1664,7 @@ int main() {
                 unsigned long long last_gpu_result = 0ULL;
                 unsigned long long last_final_result = 0ULL;
 
+                // Execute warm-up runs first, followed by the measured runs.
                 for (int it = 0; it < warmup + iterations; ++it) {
                     unsigned long long cpu_result = 0ULL;
                     unsigned long long gpu_result = 0ULL;
@@ -1711,6 +1700,8 @@ int main() {
                     auto total_start =
                         std::chrono::high_resolution_clock::now();
 
+                    // Start CPU decompression/query work in a separate thread so
+                    // it can overlap with the GPU path driven by this thread.
                     std::thread cpu_thread([&]() {
                         try {
                             cpu_result =
@@ -1738,6 +1729,8 @@ int main() {
                     });
 
                     if (!gpu_chunk_ids.empty()) {
+                        // GPU timing covers compressed H2D transfer, nvCOMP
+                        // decompression, query execution, and the scalar result D2H.
                         const nvcompBatchedLZ4DecompressOpts_t opts =
                             nvcompBatchedLZ4DecompressDefaultOpts;
 
@@ -1770,10 +1763,8 @@ int main() {
                             CUDA_CHECK(cudaEventCreate(&stream_done[slot]));
                         }
 
-                        // Double-buffered scheduling only: same benchmark path,
-                        // but batch b uses slot b % 2. This allows H2D of one
-                        // batch to overlap with decompression/query work already
-                        // queued in the other stream.
+                        // Alternate batches between two streams/buffer slots so H2D for
+                        // one batch can overlap work already queued in the other stream.
                         for (size_t b = 0;
                              b < gpu_batches.size();
                              ++b) {
@@ -1867,7 +1858,7 @@ int main() {
                                 block_size * sizeof(unsigned long long),
                                 active_stream
                             >>>(
-                                d_partkey[slot],              // actually orderkey now
+                                d_partkey[slot],              // This buffer contains orderkey values in the active workload.
                                 d_quantity[slot],
                                 d_extendedprice[slot],
                                 d_order_custkey,
@@ -2011,6 +2002,8 @@ int main() {
                         destroy_batch_events(ev);
                     }
 
+                    // End-to-end timing closes only after CPU and GPU work have
+                    // both completed for the current iteration.
                     auto total_end =
                         std::chrono::high_resolution_clock::now();
 
@@ -2043,6 +2036,7 @@ int main() {
                     CUDA_CHECK(cudaEventDestroy(ev_gpu_start));
                     CUDA_CHECK(cudaEventDestroy(ev_gpu_end));
 
+                    // Discard warm-up observations from all reported statistics.
                     if (it >= warmup) {
                         cpu_decomp_ms_runs.push_back(cpu_decomp_ms);
                         cpu_spja_ms_runs.push_back(cpu_spja_ms);
@@ -2066,6 +2060,8 @@ int main() {
                     }
                 }
 
+                // The combined CPU/GPU aggregate must match the independent
+                // CPU reference before this assignment is considered valid.
                 const bool valid =
                     (last_final_result == reference_result);
 
@@ -2081,6 +2077,8 @@ int main() {
                 const double avg_total_ms =
                     mean(total_ms_runs);
 
+                // Normalize CPU and GPU throughput by the logical fraction of
+                // input rows assigned to each processor.
                 const double cpu_input_gib =
                     input_gib *
                     (static_cast<double>(cpu_rows) /
@@ -2124,6 +2122,8 @@ int main() {
                 trial_phys_gibps.push_back(mean(phys_gibps_runs));
                 trial_overlap_efficiency.push_back(mean(overlap_efficiency_runs));
 
+                // Persist the averaged measurements for this individual
+                // deterministic assignment trial.
                 detailed_csv
                     << "TPCH_FAIR_ASSIGN_DETAIL" << ","
                     << cpu_percent << ","
@@ -2153,6 +2153,8 @@ int main() {
                     << (valid ? "YES" : "NO")
                     << "\n";
 
+                // Release assignment-specific pinned/device resources before
+                // moving to the next deterministic chunk assignment.
                 if (!gpu_chunk_ids.empty()) {
                     if (use_registered_batch_host_memory) {
                         for (void* ptr : registered_host_buffers) {
@@ -2191,6 +2193,7 @@ int main() {
                 }
             }
 
+            // Aggregate the assignment trials into one split-level result.
             const double avg_cpu_total_ms =
                 mean(trial_cpu_total_ms);
 
@@ -2206,6 +2209,8 @@ int main() {
             const double avg_eff_gibps =
                 mean(trial_eff_gibps);
 
+            // Color is presentation-only: red/green indicates the slower side,
+            // while near-balanced CPU/GPU timings are highlighted in blue.
             std::string row_color = BLUE;
 
             if (avg_cpu_total_ms < avg_gpu_total_ms) {
@@ -2234,6 +2239,7 @@ int main() {
                       << RESET
                       << "\n";
 
+            // Write split-level averages and sample standard deviations.
             csv << "TPCH_FAIR_ASSIGN" << ","
                 << input_mib << ","
                 << cpu_percent << ","
@@ -2291,9 +2297,7 @@ int main() {
 
         detailed_csv.close();
 
-        // ------------------------------------------------------------
-        // Final summary: CPU-only, GPU-only, and best valid split.
-        // ------------------------------------------------------------
+        // Identify CPU-only, GPU-only, and the highest-throughput valid split.
         int cpu_only_idx = -1;
         int gpu_only_idx = -1;
         int best_idx = -1;
@@ -2315,6 +2319,7 @@ int main() {
             }
         }
 
+        // Write a compact summary for quick inspection without parsing the CSV.
         std::ofstream summary_file(SUMMARY_PATH);
 
         summary_file << "Benchmark summary\n";
@@ -2406,6 +2411,7 @@ int main() {
                       << improvement_gpu << "\n";
         }
 
+        // Finalize the aggregate output after every split has been recorded.
         csv.close();
 
         std::cout << "\nDone. Main CSV written to:\n";
@@ -2425,5 +2431,19 @@ int main() {
     }
 }
 
-// // // nvcc -std=c++17 -O3   -I ~/nvcomp_env/lib/python3.12/site-packages/nvidia/libnvcomp/include   src/benchmark/spja_lz4_nvcomp_split_overlap_strings.cu   -L ~/nvcomp_env/lib/python3.12/site-packages/nvidia/libnvcomp/lib64   -lnvcomp -llz4   -o bin/spja_lz4_nvcomp_split_overlap_strings
-// // // LD_LIBRARY_PATH=~/nvcomp_env/lib/python3.12/site-packages/nvidia/libnvcomp/lib64:$LD_LIBRARY_PATH ./bin/spja_lz4_nvcomp_split_overlap_strings
+// Build:
+//
+// mkdir -p bin
+//
+// nvcc -std=c++17 -O3 -arch=sm_86 \
+//     -Xcompiler -pthread \
+//     -I $HOME/nvcomp_env/lib/python3.12/site-packages/nvidia/libnvcomp/include \
+//     src/benchmark/spja_lz4_nvcomp_split_overlap_strings.cu \
+//     -L $HOME/nvcomp_env/lib/python3.12/site-packages/nvidia/libnvcomp/lib64 \
+//     -lnvcomp -llz4 \
+//     -o bin/spja_lz4_nvcomp_split_overlap_strings
+//
+// Run:
+//
+// LD_LIBRARY_PATH=$HOME/nvcomp_env/lib/python3.12/site-packages/nvidia/libnvcomp/lib64:$LD_LIBRARY_PATH \
+//     ./bin/spja_lz4_nvcomp_split_overlap_strings

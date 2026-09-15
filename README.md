@@ -461,7 +461,7 @@ The primary LZ4/nvCOMP experiments use:
 Chunk size:       512 KiB
 Compression:      LZ4_HC
 Compression level: 8
-GPU batch size:   120 chunks
+GPU batch size:   768 chunks
 ```
 
 Compression is treated as preprocessing rather than part of the timed analytical query execution.

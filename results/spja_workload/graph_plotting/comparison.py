@@ -9,6 +9,9 @@ import numpy as np
 import pandas as pd
 
 
+# Default benchmark inputs for the two independent ablation experiments.
+# Compression compares compressed and uncompressed execution with H2D timed,
+# while the H2D experiment keeps compression fixed and changes transfer timing.
 DEFAULT_COMPRESSION_CSV = Path(
     "results/spja_workload/csv/"
     "spja_compressed_vs_uncompressed_results.csv"
@@ -19,6 +22,7 @@ DEFAULT_H2D_CSV = Path(
     "spja_h2d_vs_no_h2d_results.csv"
 )
 
+# Figures and small audit tables are written to one dedicated key-findings folder.
 DEFAULT_OUTPUT_DIR = Path(
     "results/spja_workload/graphs/key_findings"
 )
@@ -27,6 +31,8 @@ BLUE = "#1f77b4"
 ORANGE = "#ff7f0e"
 LIGHT_ORANGE = "#fdb462"
 
+# The plotting code validates the benchmark schema before producing figures so
+# malformed or incompatible CSV snapshots cannot silently enter the comparison.
 REQUIRED_COLUMNS = {
     "Experiment",
     "Mode",
@@ -53,6 +59,8 @@ REQUIRED_COLUMNS = {
 }
 
 
+# Allow the default repository paths and output resolution to be overridden
+# without changing the plotting source.
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Generate four independent compression/H2D graphs."
@@ -76,6 +84,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+# Apply one consistent visual configuration to all four generated figures.
 def configure_matplotlib() -> None:
     plt.rcParams.update(
         {
@@ -92,6 +101,9 @@ def configure_matplotlib() -> None:
     )
 
 
+# Load and validate one experiment before any values are plotted. In addition
+# to schema checks, this verifies correctness, split coverage, and throughput
+# arithmetic against the recorded end-to-end runtime.
 def load_experiment(
     path: Path,
     expected_experiment: str,
@@ -103,12 +115,15 @@ def load_experiment(
     dataframe = pd.read_csv(path)
     dataframe.columns = dataframe.columns.str.strip()
 
+    # Fail early if a benchmark CSV does not contain the expected final schema.
     missing = REQUIRED_COLUMNS.difference(dataframe.columns)
     if missing:
         raise ValueError(
             f"{path} is missing columns: " + ", ".join(sorted(missing))
         )
 
+    # Convert every numerical benchmark field explicitly so bad rows are detected
+    # instead of being propagated into NumPy or Matplotlib as object values.
     numeric_columns = sorted(REQUIRED_COLUMNS.difference({"Experiment", "Mode", "Valid"}))
     for column in numeric_columns:
         dataframe[column] = pd.to_numeric(dataframe[column], errors="coerce")
@@ -123,6 +138,8 @@ def load_experiment(
     dataframe["Mode"] = dataframe["Mode"].astype(str).str.strip()
     dataframe["Valid"] = dataframe["Valid"].astype(str).str.strip().str.upper()
 
+    # Keep the two ablation studies isolated; mixing experiment rows would make
+    # the grouped comparisons scientifically ambiguous.
     if set(dataframe["Experiment"].unique()) != {expected_experiment}:
         raise ValueError(
             f"{path} does not contain only experiment {expected_experiment}."
@@ -134,6 +151,8 @@ def load_experiment(
             f"expected {sorted(expected_modes)}."
         )
 
+    # Only plot runs that passed the benchmark correctness checks and whose final
+    # aggregate agrees with the independently computed reference result.
     if not dataframe["Valid"].isin({"YES", "TRUE", "1"}).all():
         raise ValueError(f"At least one row in {path} is not valid.")
 
@@ -155,6 +174,7 @@ def load_experiment(
     if duplicates.any():
         raise ValueError(f"Duplicate mode/split rows found in {path}.")
 
+    # Require the complete five-point CPU/GPU split sweep for each mode.
     expected_gpu_splits = [0, 25, 50, 75, 100]
     for mode in expected_modes:
         splits = (
@@ -169,6 +189,8 @@ def load_experiment(
                 f"expected {expected_gpu_splits}."
             )
 
+    # Recompute effective throughput from logical input size and measured E2E time.
+    # This guards against plotting a stale or mismatched throughput column.
     # Verify throughput arithmetic: logical GiB / measured E2E seconds.
     expected_throughput = (
         dataframe["Input_MiB"].to_numpy(float) / 1024.0
@@ -184,6 +206,7 @@ def load_experiment(
     return dataframe.sort_values(["Mode", "GPU_Percent"]).reset_index(drop=True)
 
 
+# Return one mode in increasing GPU-share order so paired bars align by split.
 def mode_frame(dataframe: pd.DataFrame, mode: str) -> pd.DataFrame:
     return (
         dataframe[dataframe["Mode"] == mode]
@@ -192,6 +215,7 @@ def mode_frame(dataframe: pd.DataFrame, mode: str) -> pd.DataFrame:
     )
 
 
+# Format the measured CPU/GPU percentages as compact x-axis split labels.
 def split_labels(frame: pd.DataFrame) -> list[str]:
     return [
         f"{int(cpu)}/{int(gpu)}"
@@ -203,6 +227,8 @@ def split_labels(frame: pd.DataFrame) -> list[str]:
     ]
 
 
+# Save every figure in both raster and vector form for repository use and thesis
+# inclusion, then close it to avoid retaining Matplotlib state between plots.
 def save_figure(
     figure: plt.Figure,
     output_directory: Path,
@@ -215,6 +241,8 @@ def save_figure(
     plt.close(figure)
 
 
+# Place the measured mean directly above each non-zero bar using the requested
+# precision; the offset scales with the current y-axis range.
 def add_labels(
     axis: plt.Axes,
     bars,
@@ -237,6 +265,8 @@ def add_labels(
         )
 
 
+# Shared grouped-bar routine used by all four key-finding figures. Means and
+# standard deviations come directly from the validated benchmark CSVs.
 def grouped_plot(
     *,
     labels: list[str],
@@ -286,6 +316,8 @@ def grouped_plot(
         zorder=3,
     )
 
+    # Reserve headroom for error bars and numeric labels rather than allowing
+    # annotations to collide with the top of the plotting area.
     highest = max(
         float(np.max(left_values + left_std)),
         float(np.max(right_values + right_std)),
@@ -316,6 +348,9 @@ def grouped_plot(
     save_figure(figure, output_directory, filename, dpi)
 
 
+# Compare uncompressed execution against the LZ4/nvCOMP representation while
+# keeping H2D inside the timed region for both modes. This isolates the effect
+# of using compressed data in the end-to-end SPJA pipeline.
 def plot_compression_experiment(
     dataframe: pd.DataFrame,
     output_directory: Path,
@@ -380,6 +415,8 @@ def plot_compression_experiment(
     )
 
 
+# Compare the same compressed pipeline with and without compressed H2D inside
+# the timed region, isolating transfer cost from compression representation.
 def plot_h2d_experiment(
     dataframe: pd.DataFrame,
     output_directory: Path,
@@ -389,6 +426,8 @@ def plot_h2d_experiment(
     without_h2d = mode_frame(dataframe, "WITHOUT_H2D")
     labels = split_labels(with_h2d)
 
+    # Preserve measured values exactly. A material reversal is reported only as
+    # a warning because normal benchmark noise can occasionally invert the trend.
     # Do not alter values. Warn when noise reverses the expected direction.
     active_gpu = with_h2d["GPU_Percent"].to_numpy(float) > 0.0
     time_difference = (
@@ -467,6 +506,8 @@ def plot_h2d_experiment(
     )
 
 
+# Validate both experiment snapshots, generate the four figures, and write small
+# audit CSVs containing exactly the values used for the plotted comparisons.
 def main() -> int:
     arguments = parse_args()
     configure_matplotlib()
@@ -519,3 +560,16 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+# Run from the repository root:
+#
+# python3 results/spja_workload/graph_plotting/comparison.py
+#
+# Optional overrides:
+#   --compression-csv <path>
+#   --h2d-csv <path>
+#   --output-dir <path>
+#   --dpi <integer>
+#
+# Default outputs are written under:
+# results/spja_workload/graphs/key_findings/

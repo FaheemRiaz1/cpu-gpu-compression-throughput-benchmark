@@ -1,0 +1,140 @@
+Paste this somewhere as your **FastLanes-GPU command checklist**.
+
+```bash
+# ============================================================
+# FastLanes-GPU benchmark commands
+# Run from repo root:
+# ~/gpu_benchmark_clean
+# ============================================================
+
+# ----------------------------
+# 0) Build FastLanes-GPU tools
+# ----------------------------
+cmake -S external -B build \
+  -DCMAKE_PREFIX_PATH="$PWD/external/local" \
+  -Dnvcomp_DIR=/home/riaz/nvcomp_env/lib/python3.12/site-packages/nvidia/libnvcomp/lib64/cmake/nvcomp
+
+cmake --build build --target fastlanes_gpu_compress -j$(nproc)
+cmake --build build --target fastlanes_gpu_decompress -j$(nproc)
+```
+
+## 1) Original SF10 quantity layout
+
+```bash
+# Create FastLanes input folder
+mkdir -p results/baseline_fastlanes_gpu/quantity_sf10_original
+
+# Link original SF10 quantity column as raw.dat
+ln -sf "$PWD/data/tpch_columnar_sf10/quantity_sf10.bin" \
+  results/baseline_fastlanes_gpu/quantity_sf10_original/raw.dat
+
+# Remove old FastLanes output for clean run
+rm -rf results/baseline_fastlanes_gpu/quantity_sf10_original/fastlanes_gpu
+
+# Compress
+bash external/scripts/fastlanes_gpu/compress.sh \
+  results/baseline_fastlanes_gpu/quantity_sf10_original
+
+# Decompress + benchmark
+bash external/scripts/fastlanes_gpu/decompress.sh \
+  results/baseline_fastlanes_gpu/quantity_sf10_original
+
+# Show result
+cat results/baseline_fastlanes_gpu/quantity_sf10_original/fastlanes_gpu/decompress_benchmark.txt
+
+# Optional: remove decompressed output to save disk
+rm -f results/baseline_fastlanes_gpu/quantity_sf10_original/fastlanes_gpu/decompressed.dat
+```
+
+## 2) LZ4-friendly sorted SF10 quantity layout
+
+```bash
+mkdir -p results/baseline_fastlanes_gpu/quantity_sf10_sorted_lz4best
+
+ln -sf "$PWD/data/tpch_columnar_sf10/quantity_sf10_sorted_lz4best.bin" \
+  results/baseline_fastlanes_gpu/quantity_sf10_sorted_lz4best/raw.dat
+
+rm -rf results/baseline_fastlanes_gpu/quantity_sf10_sorted_lz4best/fastlanes_gpu
+
+bash external/scripts/fastlanes_gpu/compress.sh \
+  results/baseline_fastlanes_gpu/quantity_sf10_sorted_lz4best
+
+bash external/scripts/fastlanes_gpu/decompress.sh \
+  results/baseline_fastlanes_gpu/quantity_sf10_sorted_lz4best
+
+cat results/baseline_fastlanes_gpu/quantity_sf10_sorted_lz4best/fastlanes_gpu/decompress_benchmark.txt
+
+rm -f results/baseline_fastlanes_gpu/quantity_sf10_sorted_lz4best/fastlanes_gpu/decompressed.dat
+```
+
+## 3) LZ4-friendly sorted SF10 quantity ×23
+
+```bash
+mkdir -p results/baseline_fastlanes_gpu/quantity_sf10_sorted_lz4best_5gib
+
+ln -sf "$PWD/data/baseline_quantity_sf10_sorted_lz4best_repeated/quantity_sf10_sorted_lz4best_repeated_23x_5gib.bin" \
+  results/baseline_fastlanes_gpu/quantity_sf10_sorted_lz4best_5gib/raw.dat
+
+rm -rf results/baseline_fastlanes_gpu/quantity_sf10_sorted_lz4best_5gib/fastlanes_gpu
+
+bash external/scripts/fastlanes_gpu/compress.sh \
+  results/baseline_fastlanes_gpu/quantity_sf10_sorted_lz4best_5gib
+
+bash external/scripts/fastlanes_gpu/decompress.sh \
+  results/baseline_fastlanes_gpu/quantity_sf10_sorted_lz4best_5gib
+
+cat results/baseline_fastlanes_gpu/quantity_sf10_sorted_lz4best_5gib/fastlanes_gpu/decompress_benchmark.txt
+
+rm -f results/baseline_fastlanes_gpu/quantity_sf10_sorted_lz4best_5gib/fastlanes_gpu/decompressed.dat
+```
+
+## 4) LZ4-friendly sorted SF10 quantity ×45 / 10 GiB
+
+This one failed on RTX A2000 12GB, but keep the command for reproducibility.
+
+```bash
+mkdir -p results/baseline_fastlanes_gpu/quantity_sf10_sorted_lz4best_10gib
+
+ln -sf "$PWD/data/baseline_quantity_sf10_sorted_lz4best_repeated/quantity_sf10_sorted_lz4best_repeated_45x_10gib.bin" \
+  results/baseline_fastlanes_gpu/quantity_sf10_sorted_lz4best_10gib/raw.dat
+
+rm -rf results/baseline_fastlanes_gpu/quantity_sf10_sorted_lz4best_10gib/fastlanes_gpu
+
+bash external/scripts/fastlanes_gpu/compress.sh \
+  results/baseline_fastlanes_gpu/quantity_sf10_sorted_lz4best_10gib
+
+bash external/scripts/fastlanes_gpu/decompress.sh \
+  results/baseline_fastlanes_gpu/quantity_sf10_sorted_lz4best_10gib
+
+cat results/baseline_fastlanes_gpu/quantity_sf10_sorted_lz4best_10gib/fastlanes_gpu/decompress_benchmark.txt
+```
+
+## Useful result-collection commands
+
+```bash
+# Show all saved FastLanes benchmark files
+find results/baseline_fastlanes_gpu -name "decompress_benchmark*" -type f -ls
+
+# Print all saved FastLanes benchmark results
+for f in $(find results/baseline_fastlanes_gpu -name "decompress_benchmark*" -type f | sort); do
+  echo "===== $f ====="
+  cat "$f"
+  echo
+done
+
+# Check disk usage
+df -h .
+du -h --max-depth=2 results/baseline_fastlanes_gpu | sort -h | tail -30
+```
+
+## Expected saved result paths
+
+```text
+results/baseline_fastlanes_gpu/quantity_sf10_original/fastlanes_gpu/decompress_benchmark.txt
+
+results/baseline_fastlanes_gpu/quantity_sf10_sorted_lz4best/fastlanes_gpu/decompress_benchmark.txt
+
+results/baseline_fastlanes_gpu/quantity_sf10_sorted_lz4best_5gib/fastlanes_gpu/decompress_benchmark.txt
+
+results/baseline_fastlanes_gpu/quantity_sf10_sorted_lz4best_10gib/fastlanes_gpu/decompress_benchmark.txt
+```

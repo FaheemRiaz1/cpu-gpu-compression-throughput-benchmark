@@ -13,12 +13,11 @@
 #include <string>
 #include <thread>
 #include <vector>
-
 #include <cuda_runtime.h>
 #include <lz4.h>
 #include <lz4hc.h>
 #include <nvcomp/lz4.h>
-
+// Fail fast on CUDA runtime errors and report the source location.
 #define CUDA_CHECK(call) do { \
     const cudaError_t e__ = (call); \
     if (e__ != cudaSuccess) { \
@@ -27,7 +26,7 @@
         std::exit(EXIT_FAILURE); \
     } \
 } while (false)
-
+// Apply the same fail-fast handling to nvCOMP API calls.
 #define NVCOMP_CHECK(call) do { \
     const nvcompStatus_t s__ = (call); \
     if (s__ != nvcompSuccess) { \
@@ -36,21 +35,19 @@
         std::exit(EXIT_FAILURE); \
     } \
 } while (false)
-
 namespace {
-
+// Output location used by this supporting four-mode SPJA experiment.
 const std::string OUTPUT_CSV =
     "results/spja_workload/csv/spja_lz4_nvcomp_four_mode_results.csv";
-
 constexpr int BLOCK_SIZE = 256;
 constexpr size_t MAX_GPU_BATCHES = 2;
-
+// Execution modes used to isolate compression and host-to-device transfer costs.
 enum class Mode {
     UncompressedWithH2D,
     CompressedWithH2D,
     CompressedWithoutH2D
 };
-
+// Stable labels used in result output.
 const char* mode_name(Mode mode) {
     switch (mode) {
         case Mode::UncompressedWithH2D:
@@ -62,18 +59,18 @@ const char* mode_name(Mode mode) {
     }
     return "UNKNOWN";
 }
-
+// Wall-clock timing helper used for CPU and end-to-end measurements.
 template <typename A, typename B>
 double ms_between(const A& start, const B& end) {
     return std::chrono::duration<double, std::milli>(end - start).count();
 }
-
+// Arithmetic mean over repeated benchmark runs.
 double mean(const std::vector<double>& values) {
     if (values.empty()) return 0.0;
     return std::accumulate(values.begin(), values.end(), 0.0) /
            static_cast<double>(values.size());
 }
-
+// Sample standard deviation for run-to-run variability.
 double sample_stddev(const std::vector<double>& values) {
     if (values.size() < 2) return 0.0;
     const double avg = mean(values);
@@ -84,31 +81,28 @@ double sample_stddev(const std::vector<double>& values) {
     }
     return std::sqrt(sum / static_cast<double>(values.size() - 1));
 }
-
+// Binary unit conversion helpers used for reporting input size and throughput.
 double bytes_to_mib(size_t bytes) {
     return static_cast<double>(bytes) / (1024.0 * 1024.0);
 }
-
 double bytes_to_gib(size_t bytes) {
     return static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0);
 }
-
+// Return the size of a binary input column before loading it.
 size_t file_size_bytes(const std::string& path) {
     std::ifstream file(path, std::ios::binary | std::ios::ate);
     if (!file) throw std::runtime_error("Could not open file: " + path);
     return static_cast<size_t>(file.tellg());
 }
-
+// Load one generated int32 column from disk.
 std::vector<int> read_int_column(const std::string& path) {
     const size_t bytes = file_size_bytes(path);
     if (bytes % sizeof(int) != 0) {
         throw std::runtime_error("Invalid int column size: " + path);
     }
-
     std::vector<int> values(bytes / sizeof(int));
     std::ifstream file(path, std::ios::binary);
     if (!file) throw std::runtime_error("Could not open file: " + path);
-
     file.read(reinterpret_cast<char*>(values.data()),
               static_cast<std::streamsize>(bytes));
     if (static_cast<size_t>(file.gcount()) != bytes) {
@@ -116,7 +110,7 @@ std::vector<int> read_int_column(const std::string& path) {
     }
     return values;
 }
-
+// Scalar SPJA implementation used as the CPU query path and correctness reference.
 unsigned long long spja_cpu_rows(
     const int* orderkey,
     const int* quantity,
@@ -140,7 +134,7 @@ unsigned long long spja_cpu_rows(
     }
     return sum;
 }
-
+// GPU SPJA kernel over uncompressed fact columns. Each block produces one partial aggregate.
 __global__ void spja_gpu_kernel(
     const int* orderkey,
     const int* quantity,
@@ -156,7 +150,6 @@ __global__ void spja_gpu_kernel(
     extern __shared__ unsigned long long shared_sum[];
     const unsigned int tid = threadIdx.x;
     const size_t i = blockIdx.x * blockDim.x + threadIdx.x;
-
     unsigned long long value = 0ULL;
     if (i < rows) {
         const int ok = orderkey[i];
@@ -169,7 +162,6 @@ __global__ void spja_gpu_kernel(
             }
         }
     }
-
     shared_sum[tid] = value;
     __syncthreads();
     for (unsigned int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
@@ -178,7 +170,7 @@ __global__ void spja_gpu_kernel(
     }
     if (tid == 0) block_sums[blockIdx.x] = shared_sum[0];
 }
-
+// Reduce block-level SPJA aggregates into the final device-side result.
 __global__ void reduce_block_sums_kernel(
     const unsigned long long* block_sums,
     size_t n_blocks,
@@ -189,21 +181,21 @@ __global__ void reduce_block_sums_kernel(
     const size_t i = blockIdx.x * blockDim.x + threadIdx.x;
     shared_sum[tid] = (i < n_blocks) ? block_sums[i] : 0ULL;
     __syncthreads();
-
     for (unsigned int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
         if (tid < stride) shared_sum[tid] += shared_sum[tid + stride];
         __syncthreads();
     }
     if (tid == 0) atomicAdd(result, shared_sum[0]);
 }
-
+// Chunked LZ4 representation of one fact column.
 struct CompressedColumn {
     std::vector<size_t> uncomp_sizes;
     std::vector<size_t> comp_sizes;
     std::vector<std::vector<char>> comp_chunks;
     size_t total_comp_bytes = 0;
 };
-
+// Compress a fact column independently in fixed-size LZ4_HC chunks.
+// This preprocessing step is measured separately and excluded from query E2E timing.
 CompressedColumn compress_column_lz4_hc(
     const int* data,
     size_t rows,
@@ -215,14 +207,12 @@ CompressedColumn compress_column_lz4_hc(
     output.uncomp_sizes.resize(chunks);
     output.comp_sizes.resize(chunks);
     output.comp_chunks.resize(chunks);
-
     const char* bytes = reinterpret_cast<const char*>(data);
     for (size_t chunk = 0; chunk < chunks; ++chunk) {
         const size_t first_row = chunk * chunk_rows;
         const size_t rows_here = std::min(chunk_rows, rows - first_row);
         const size_t uncompressed_bytes = rows_here * sizeof(int);
         const int bound = LZ4_compressBound(static_cast<int>(uncompressed_bytes));
-
         output.comp_chunks[chunk].resize(static_cast<size_t>(bound));
         const int compressed = LZ4_compress_HC(
             bytes + first_row * sizeof(int),
@@ -232,7 +222,6 @@ CompressedColumn compress_column_lz4_hc(
             level
         );
         if (compressed <= 0) throw std::runtime_error("LZ4_HC failed.");
-
         output.comp_chunks[chunk].resize(static_cast<size_t>(compressed));
         output.uncomp_sizes[chunk] = uncompressed_bytes;
         output.comp_sizes[chunk] = static_cast<size_t>(compressed);
@@ -240,7 +229,7 @@ CompressedColumn compress_column_lz4_hc(
     }
     return output;
 }
-
+// Small helper used to construct deterministic fair chunk permutations.
 size_t gcd_size_t(size_t a, size_t b) {
     while (b != 0) {
         const size_t remainder = a % b;
@@ -249,7 +238,7 @@ size_t gcd_size_t(size_t a, size_t b) {
     }
     return a;
 }
-
+// Select a stride coprime with the chunk count so each trial visits every chunk exactly once.
 size_t choose_coprime_stride(size_t chunks, int trial) {
     const size_t candidates[] = {1, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37};
     const size_t count = sizeof(candidates) / sizeof(candidates[0]);
@@ -261,7 +250,8 @@ size_t choose_coprime_stride(size_t chunks, int trial) {
     }
     return 1;
 }
-
+// Assign chunks to CPU and GPU using a deterministic permutation.
+// Varying stride and offset across trials avoids always favoring the same contiguous region.
 void build_fair_assignment(
     size_t total_chunks,
     size_t gpu_chunks,
@@ -272,28 +262,23 @@ void build_fair_assignment(
     cpu_ids.clear();
     gpu_ids.clear();
     if (total_chunks == 0) return;
-
     const size_t stride = choose_coprime_stride(total_chunks, trial);
     const size_t offset = (static_cast<size_t>(trial) * 17ULL) % total_chunks;
-
     for (size_t i = 0; i < total_chunks; ++i) {
         const size_t chunk = (offset + i * stride) % total_chunks;
         if (i < gpu_chunks) gpu_ids.push_back(chunk);
         else cpu_ids.push_back(chunk);
     }
-
     std::sort(cpu_ids.begin(), cpu_ids.end());
     std::sort(gpu_ids.begin(), gpu_ids.end());
 }
-
+// Host-side representation of one GPU batch containing both raw and compressed fact data.
 struct GpuBatch {
     size_t rows = 0;
     size_t comp_bytes = 0;
-
     std::vector<int> raw_orderkey;
     std::vector<int> raw_quantity;
     std::vector<int> raw_price;
-
     std::vector<char> comp_flat;
     std::vector<size_t> comp_sizes;
     std::vector<size_t> uncomp_sizes;
@@ -301,7 +286,7 @@ struct GpuBatch {
     std::vector<size_t> row_offsets;
     std::vector<int> column_ids;
 };
-
+// Gather the GPU-owned chunks into a contiguous batch and build nvCOMP metadata.
 GpuBatch build_gpu_batch(
     const std::vector<size_t>& gpu_ids,
     size_t begin,
@@ -318,16 +303,13 @@ GpuBatch build_gpu_batch(
     GpuBatch batch;
     size_t rows_total = 0;
     size_t comp_total = 0;
-
     const CompressedColumn* compressed_columns[3] = {
         &comp_orderkey, &comp_quantity, &comp_price
     };
-
     for (size_t local = 0; local < count; ++local) {
         const size_t chunk = gpu_ids[begin + local];
         const size_t first_row = chunk * chunk_rows;
         const size_t rows_here = std::min(chunk_rows, total_rows - first_row);
-
         for (int column = 0; column < 3; ++column) {
             const CompressedColumn& source = *compressed_columns[column];
             batch.comp_offsets.push_back(comp_total);
@@ -339,22 +321,18 @@ GpuBatch build_gpu_batch(
         }
         rows_total += rows_here;
     }
-
     batch.rows = rows_total;
     batch.comp_bytes = comp_total;
     batch.raw_orderkey.resize(rows_total);
     batch.raw_quantity.resize(rows_total);
     batch.raw_price.resize(rows_total);
     batch.comp_flat.resize(comp_total);
-
     size_t row_destination = 0;
     size_t comp_destination = 0;
-
     for (size_t local = 0; local < count; ++local) {
         const size_t chunk = gpu_ids[begin + local];
         const size_t first_row = chunk * chunk_rows;
         const size_t rows_here = std::min(chunk_rows, total_rows - first_row);
-
         std::memcpy(batch.raw_orderkey.data() + row_destination,
                     raw_orderkey.data() + first_row,
                     rows_here * sizeof(int));
@@ -364,7 +342,6 @@ GpuBatch build_gpu_batch(
         std::memcpy(batch.raw_price.data() + row_destination,
                     raw_price.data() + first_row,
                     rows_here * sizeof(int));
-
         const CompressedColumn* columns[3] = {
             &comp_orderkey, &comp_quantity, &comp_price
         };
@@ -377,15 +354,14 @@ GpuBatch build_gpu_batch(
         }
         row_destination += rows_here;
     }
-
     return batch;
 }
-
+// Aggregate and elapsed time produced by one CPU path execution.
 struct CpuResult {
     unsigned long long sum = 0ULL;
     double total_ms = 0.0;
 };
-
+// Process CPU-owned chunks directly from the uncompressed fact columns using worker threads.
 CpuResult process_cpu_raw(
     const std::vector<size_t>& chunk_ids,
     const std::vector<int>& orderkey,
@@ -402,25 +378,21 @@ CpuResult process_cpu_raw(
 ) {
     const auto start = std::chrono::high_resolution_clock::now();
     if (chunk_ids.empty()) return CpuResult{};
-
     const int threads = std::max(1, std::min(
         requested_threads, static_cast<int>(chunk_ids.size())));
     const size_t chunks_per_thread =
         (chunk_ids.size() + static_cast<size_t>(threads) - 1) /
         static_cast<size_t>(threads);
-
     std::vector<unsigned long long> sums(static_cast<size_t>(threads), 0ULL);
     std::vector<std::exception_ptr> exceptions(static_cast<size_t>(threads));
     std::vector<std::thread> workers;
     workers.reserve(static_cast<size_t>(threads));
-
     for (int thread = 0; thread < threads; ++thread) {
         workers.emplace_back([&, thread]() {
             try {
                 const size_t begin = static_cast<size_t>(thread) * chunks_per_thread;
                 const size_t end = std::min(begin + chunks_per_thread, chunk_ids.size());
                 unsigned long long local_sum = 0ULL;
-
                 for (size_t i = begin; i < end; ++i) {
                     const size_t chunk = chunk_ids[i];
                     const size_t first_row = chunk * chunk_rows;
@@ -443,18 +415,17 @@ CpuResult process_cpu_raw(
             }
         });
     }
-
     for (auto& worker : workers) worker.join();
     for (const auto& exception : exceptions) {
         if (exception) std::rethrow_exception(exception);
     }
-
     CpuResult result;
     result.sum = std::accumulate(sums.begin(), sums.end(), 0ULL);
     result.total_ms = ms_between(start, std::chrono::high_resolution_clock::now());
     return result;
 }
-
+// Decompress CPU-owned LZ4 chunks locally, then execute the same SPJA query.
+// CPU decompression is part of this compressed CPU-path measurement.
 CpuResult process_cpu_compressed(
     const std::vector<size_t>& chunk_ids,
     const CompressedColumn& orderkey,
@@ -471,18 +442,15 @@ CpuResult process_cpu_compressed(
 ) {
     const auto start = std::chrono::high_resolution_clock::now();
     if (chunk_ids.empty()) return CpuResult{};
-
     const int threads = std::max(1, std::min(
         requested_threads, static_cast<int>(chunk_ids.size())));
     const size_t chunks_per_thread =
         (chunk_ids.size() + static_cast<size_t>(threads) - 1) /
         static_cast<size_t>(threads);
-
     std::vector<unsigned long long> sums(static_cast<size_t>(threads), 0ULL);
     std::vector<std::exception_ptr> exceptions(static_cast<size_t>(threads));
     std::vector<std::thread> workers;
     workers.reserve(static_cast<size_t>(threads));
-
     for (int thread = 0; thread < threads; ++thread) {
         workers.emplace_back([&, thread]() {
             try {
@@ -492,17 +460,14 @@ CpuResult process_cpu_compressed(
                 std::vector<int> local_quantity;
                 std::vector<int> local_price;
                 unsigned long long local_sum = 0ULL;
-
                 for (size_t i = begin; i < end; ++i) {
                     const size_t chunk = chunk_ids[i];
                     const size_t first_row = chunk * chunk_rows;
                     const size_t rows_here = std::min(chunk_rows, total_rows - first_row);
                     const int expected = static_cast<int>(rows_here * sizeof(int));
-
                     local_orderkey.resize(rows_here);
                     local_quantity.resize(rows_here);
                     local_price.resize(rows_here);
-
                     const int a = LZ4_decompress_safe(
                         orderkey.comp_chunks[chunk].data(),
                         reinterpret_cast<char*>(local_orderkey.data()),
@@ -515,11 +480,9 @@ CpuResult process_cpu_compressed(
                         price.comp_chunks[chunk].data(),
                         reinterpret_cast<char*>(local_price.data()),
                         static_cast<int>(price.comp_sizes[chunk]), expected);
-
                     if (a != expected || b != expected || c != expected) {
                         throw std::runtime_error("CPU LZ4 decompression failed.");
                     }
-
                     local_sum += spja_cpu_rows(
                         local_orderkey.data(),
                         local_quantity.data(),
@@ -538,18 +501,16 @@ CpuResult process_cpu_compressed(
             }
         });
     }
-
     for (auto& worker : workers) worker.join();
     for (const auto& exception : exceptions) {
         if (exception) std::rethrow_exception(exception);
     }
-
     CpuResult result;
     result.sum = std::accumulate(sums.begin(), sums.end(), 0ULL);
     result.total_ms = ms_between(start, std::chrono::high_resolution_clock::now());
     return result;
 }
-
+// Device-side pointer and size arrays required by nvCOMP batched decompression.
 struct DeviceBatchState {
     size_t count = 0;
     void** d_comp_ptrs = nullptr;
@@ -559,7 +520,7 @@ struct DeviceBatchState {
     size_t* d_actual_sizes = nullptr;
     nvcompStatus_t* d_statuses = nullptr;
 };
-
+// CUDA resources associated with one GPU batch.
 struct DeviceBatch {
     cudaStream_t stream = nullptr;
     char* d_comp = nullptr;
@@ -571,14 +532,14 @@ struct DeviceBatch {
     unsigned long long* d_block_sums = nullptr;
     DeviceBatchState state;
 };
-
+// Persistent GPU resources shared across the repeated measurements for one assignment trial.
 struct GpuResources {
     std::vector<DeviceBatch> batches;
     int* d_order_custkey = nullptr;
     int* d_customer_nation = nullptr;
     unsigned long long* d_result = nullptr;
 };
-
+// Release nvCOMP metadata allocated for one device batch.
 void destroy_device_state(DeviceBatchState& state) {
     if (state.d_comp_ptrs) CUDA_CHECK(cudaFree(state.d_comp_ptrs));
     if (state.d_decomp_ptrs) CUDA_CHECK(cudaFree(state.d_decomp_ptrs));
@@ -588,7 +549,7 @@ void destroy_device_state(DeviceBatchState& state) {
     if (state.d_statuses) CUDA_CHECK(cudaFree(state.d_statuses));
     state = DeviceBatchState{};
 }
-
+// Release all CUDA allocations, streams, and persistent lookup arrays for an assignment trial.
 void destroy_gpu_resources(GpuResources& resources) {
     for (DeviceBatch& batch : resources.batches) {
         destroy_device_state(batch.state);
@@ -605,7 +566,7 @@ void destroy_gpu_resources(GpuResources& resources) {
     if (resources.d_result) CUDA_CHECK(cudaFree(resources.d_result));
     resources = GpuResources{};
 }
-
+// Allocate reusable GPU buffers and upload lookup arrays once before timed execution.
 GpuResources create_gpu_resources(
     const std::vector<GpuBatch>& host_batches,
     const std::vector<int>& order_custkey,
@@ -618,22 +579,18 @@ GpuResources create_gpu_resources(
         throw std::runtime_error(
             "More than two GPU batches were created. Increase gpu_batch_chunks.");
     }
-
     resources.batches.resize(host_batches.size());
     CUDA_CHECK(cudaMalloc(&resources.d_order_custkey,
                           order_custkey.size() * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&resources.d_customer_nation,
                           customer_nation.size() * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&resources.d_result, sizeof(unsigned long long)));
-
     CUDA_CHECK(cudaMemcpy(resources.d_order_custkey, order_custkey.data(),
                           order_custkey.size() * sizeof(int), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(resources.d_customer_nation, customer_nation.data(),
                           customer_nation.size() * sizeof(int), cudaMemcpyHostToDevice));
-
     const nvcompBatchedLZ4DecompressOpts_t opts =
         nvcompBatchedLZ4DecompressDefaultOpts;
-
     for (size_t i = 0; i < host_batches.size(); ++i) {
         const GpuBatch& host = host_batches[i];
         DeviceBatch& device = resources.batches[i];
@@ -642,11 +599,9 @@ GpuResources create_gpu_resources(
         CUDA_CHECK(cudaMalloc(&device.d_orderkey, host.rows * sizeof(int)));
         CUDA_CHECK(cudaMalloc(&device.d_quantity, host.rows * sizeof(int)));
         CUDA_CHECK(cudaMalloc(&device.d_price, host.rows * sizeof(int)));
-
         const size_t max_blocks = (host.rows + BLOCK_SIZE - 1) / BLOCK_SIZE;
         CUDA_CHECK(cudaMalloc(&device.d_block_sums,
                               max_blocks * sizeof(unsigned long long)));
-
         DeviceBatchState& state = device.state;
         state.count = host.comp_sizes.size();
         CUDA_CHECK(cudaMalloc(&state.d_comp_ptrs, state.count * sizeof(void*)));
@@ -655,7 +610,6 @@ GpuResources create_gpu_resources(
         CUDA_CHECK(cudaMalloc(&state.d_uncomp_sizes, state.count * sizeof(size_t)));
         CUDA_CHECK(cudaMalloc(&state.d_actual_sizes, state.count * sizeof(size_t)));
         CUDA_CHECK(cudaMalloc(&state.d_statuses, state.count * sizeof(nvcompStatus_t)));
-
         std::vector<void*> comp_ptrs(state.count);
         std::vector<void*> decomp_ptrs(state.count);
         for (size_t k = 0; k < state.count; ++k) {
@@ -669,7 +623,6 @@ GpuResources create_gpu_resources(
                 decomp_ptrs[k] = device.d_price + row_offset;
             }
         }
-
         CUDA_CHECK(cudaMemcpy(state.d_comp_ptrs, comp_ptrs.data(),
                               state.count * sizeof(void*), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(state.d_decomp_ptrs, decomp_ptrs.data(),
@@ -678,7 +631,6 @@ GpuResources create_gpu_resources(
                               state.count * sizeof(size_t), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(state.d_uncomp_sizes, host.uncomp_sizes.data(),
                               state.count * sizeof(size_t), cudaMemcpyHostToDevice));
-
         size_t temp_bytes = 0;
         NVCOMP_CHECK(nvcompBatchedLZ4DecompressGetTempSizeSync(
             (const void* const* const)state.d_comp_ptrs,
@@ -694,10 +646,10 @@ GpuResources create_gpu_resources(
         device.temp_bytes = std::max<size_t>(1, temp_bytes);
         CUDA_CHECK(cudaMalloc(&device.d_temp, device.temp_bytes));
     }
-
     return resources;
 }
-
+// Preload compressed GPU batches for the no-H2D mode.
+// This transfer occurs before timing so the mode isolates resident decompression and query work.
 void preload_compressed(
     const std::vector<GpuBatch>& host_batches,
     GpuResources& resources
@@ -715,12 +667,13 @@ void preload_compressed(
         CUDA_CHECK(cudaStreamSynchronize(batch.stream));
     }
 }
-
+// Aggregate and CUDA-event wall time produced by one GPU path execution.
 struct GpuResult {
     unsigned long long sum = 0ULL;
     double wall_ms = 0.0;
 };
-
+// Execute one GPU mode: raw transfer, compressed transfer + decompression,
+// or resident compressed decompression without timed H2D.
 GpuResult run_gpu(
     Mode mode,
     const std::vector<GpuBatch>& host_batches,
@@ -731,28 +684,22 @@ GpuResult run_gpu(
 ) {
     GpuResult result;
     if (host_batches.empty()) return result;
-
     cudaEvent_t start_event = nullptr;
     cudaEvent_t end_event = nullptr;
     CUDA_CHECK(cudaEventCreate(&start_event));
     CUDA_CHECK(cudaEventCreate(&end_event));
     CUDA_CHECK(cudaEventRecord(start_event, resources.batches[0].stream));
-
     for (size_t i = 1; i < resources.batches.size(); ++i) {
         CUDA_CHECK(cudaStreamWaitEvent(resources.batches[i].stream,
                                        start_event, 0));
     }
-
     const nvcompBatchedLZ4DecompressOpts_t opts =
         nvcompBatchedLZ4DecompressDefaultOpts;
-
     std::vector<cudaEvent_t> done(resources.batches.size(), nullptr);
-
     for (size_t i = 0; i < host_batches.size(); ++i) {
         const GpuBatch& host = host_batches[i];
         DeviceBatch& device = resources.batches[i];
         cudaStream_t stream = device.stream;
-
         if (mode == Mode::UncompressedWithH2D) {
             CUDA_CHECK(cudaMemcpyAsync(device.d_orderkey,
                                        host.raw_orderkey.data(),
@@ -773,7 +720,6 @@ GpuResult run_gpu(
                                            host.comp_bytes,
                                            cudaMemcpyHostToDevice, stream));
             }
-
             DeviceBatchState& state = device.state;
             NVCOMP_CHECK(nvcompBatchedLZ4DecompressAsync(
                 (const void* const*)state.d_comp_ptrs,
@@ -789,7 +735,6 @@ GpuResult run_gpu(
                 stream
             ));
         }
-
         const int blocks = static_cast<int>(
             (host.rows + BLOCK_SIZE - 1) / BLOCK_SIZE);
         spja_gpu_kernel<<<blocks, BLOCK_SIZE,
@@ -806,7 +751,6 @@ GpuResult run_gpu(
             device.d_block_sums
         );
         CUDA_CHECK(cudaGetLastError());
-
         const int reduce_blocks =
             (blocks + BLOCK_SIZE - 1) / BLOCK_SIZE;
         reduce_block_sums_kernel<<<reduce_blocks, BLOCK_SIZE,
@@ -816,16 +760,13 @@ GpuResult run_gpu(
             resources.d_result
         );
         CUDA_CHECK(cudaGetLastError());
-
         CUDA_CHECK(cudaEventCreate(&done[i]));
         CUDA_CHECK(cudaEventRecord(done[i], stream));
     }
-
     for (size_t i = 0; i < done.size(); ++i) {
         CUDA_CHECK(cudaStreamWaitEvent(resources.batches[0].stream,
                                        done[i], 0));
     }
-
     CUDA_CHECK(cudaMemcpyAsync(
         &result.sum,
         resources.d_result,
@@ -835,24 +776,22 @@ GpuResult run_gpu(
     ));
     CUDA_CHECK(cudaEventRecord(end_event, resources.batches[0].stream));
     CUDA_CHECK(cudaStreamSynchronize(resources.batches[0].stream));
-
     float elapsed = 0.0f;
     CUDA_CHECK(cudaEventElapsedTime(&elapsed, start_event, end_event));
     result.wall_ms = static_cast<double>(elapsed);
-
     for (cudaEvent_t event : done) CUDA_CHECK(cudaEventDestroy(event));
     CUDA_CHECK(cudaEventDestroy(start_event));
     CUDA_CHECK(cudaEventDestroy(end_event));
     return result;
 }
-
+// Combined CPU/GPU result for one concurrent execution.
 struct RunResult {
     unsigned long long final_sum = 0ULL;
     double cpu_ms = 0.0;
     double gpu_ms = 0.0;
     double e2e_ms = 0.0;
 };
-
+// Run CPU and GPU portions concurrently for one mode and report true end-to-end time.
 RunResult run_mode(
     Mode mode,
     const std::vector<size_t>& cpu_ids,
@@ -876,20 +815,16 @@ RunResult run_mode(
     if (mode == Mode::CompressedWithoutH2D && !gpu_batches.empty()) {
         preload_compressed(gpu_batches, gpu_resources);
     }
-
     if (!gpu_batches.empty()) {
         CUDA_CHECK(cudaMemset(
             gpu_resources.d_result, 0, sizeof(unsigned long long)));
         CUDA_CHECK(cudaDeviceSynchronize());
     }
-
     RunResult output;
     CpuResult cpu_result;
     GpuResult gpu_result;
     std::exception_ptr cpu_exception = nullptr;
-
     const auto e2e_start = std::chrono::high_resolution_clock::now();
-
     std::thread cpu_thread([&]() {
         try {
             if (mode == Mode::UncompressedWithH2D) {
@@ -927,7 +862,6 @@ RunResult run_mode(
             cpu_exception = std::current_exception();
         }
     });
-
     gpu_result = run_gpu(
         mode,
         gpu_batches,
@@ -936,10 +870,8 @@ RunResult run_mode(
         customer_count,
         target_nation
     );
-
     cpu_thread.join();
     if (cpu_exception) std::rethrow_exception(cpu_exception);
-
     output.cpu_ms = cpu_result.total_ms;
     output.gpu_ms = gpu_result.wall_ms;
     output.final_sum = cpu_result.sum + gpu_result.sum;
@@ -947,7 +879,7 @@ RunResult run_mode(
         e2e_start, std::chrono::high_resolution_clock::now());
     return output;
 }
-
+// Repeated measurements collected for one execution mode.
 struct ModeStats {
     std::vector<double> e2e_ms;
     std::vector<double> throughput_gibps;
@@ -956,23 +888,21 @@ struct ModeStats {
     unsigned long long last_result = 0ULL;
     bool valid = true;
 };
-
+// Results for one CPU/GPU split across the two controlled comparisons.
 struct SplitStats {
     int cpu_percent = 0;
     int gpu_percent = 0;
     double cpu_rows_avg = 0.0;
     double gpu_rows_avg = 0.0;
     double compressed_gpu_bytes_avg = 0.0;
-
     // Experiment 1: uncompressed vs compressed; H2D is timed in both.
     ModeStats compression_uncompressed;
     ModeStats compression_compressed;
-
     // Experiment 2: H2D vs no H2D; LZ4/nvCOMP is used in both.
     ModeStats h2d_with;
     ModeStats h2d_without;
 };
-
+// Validate and retain one timed run for later averaging.
 static void record_run(
     ModeStats& stats,
     const RunResult& run,
@@ -982,7 +912,6 @@ static void record_run(
     if (run.e2e_ms <= 0.0) {
         throw std::runtime_error("Measured E2E runtime is not positive.");
     }
-
     stats.e2e_ms.push_back(run.e2e_ms);
     stats.throughput_gibps.push_back(
         logical_input_gib / (run.e2e_ms / 1000.0)
@@ -992,7 +921,7 @@ static void record_run(
     stats.last_result = run.final_sum;
     stats.valid = stats.valid && (run.final_sum == reference);
 }
-
+// Write one averaged experiment/mode row to the corresponding CSV file.
 static void write_result_row(
     std::ofstream& csv,
     const char* experiment,
@@ -1029,14 +958,12 @@ static void write_result_row(
         << reference << ','
         << (stats.valid ? "YES" : "NO") << '\n';
 }
-
 }  // namespace
-
+// Run the two supporting experiments over the standard CPU/GPU split points.
 int main() {
     try {
         CUDA_CHECK(cudaSetDevice(0));
         std::system("mkdir -p results/spja_workload/csv");
-
         const std::string orderkey_path =
             "data/tpch_columnar/orderkey_sfx40.bin";
         const std::string quantity_path =
@@ -1047,15 +974,14 @@ int main() {
             "data/tpch_columnar/order_custkey_sfx40.bin";
         const std::string customer_nation_path =
             "data/tpch_columnar/customer_nation_sfx40.bin";
-
         const std::string compression_csv_path =
             "results/spja_workload/csv/"
             "spja_compressed_vs_uncompressed_results.csv";
-
         const std::string h2d_csv_path =
             "results/spja_workload/csv/"
             "spja_h2d_vs_no_h2d_results.csv";
-
+        // Benchmark configuration. Chunk-level compression enables CPU/GPU work assignment
+        // while keeping preprocessing independent of the timed query region.
         const size_t chunk_bytes = 1ULL << 20;  // 1 MiB
         const size_t chunk_rows = chunk_bytes / sizeof(int);
         const size_t gpu_batch_chunks = 768;
@@ -1064,24 +990,20 @@ int main() {
         const int timed_runs = 5;
         const int assignment_trials = 5;
         const int target_nation = 3;
-
         const unsigned int detected_threads =
             std::thread::hardware_concurrency();
         const int cpu_threads = detected_threads > 0
             ? static_cast<int>(std::min(36u, detected_threads))
             : 36;
-
         std::vector<int> orderkey = read_int_column(orderkey_path);
         std::vector<int> quantity = read_int_column(quantity_path);
         std::vector<int> price = read_int_column(price_path);
         std::vector<int> order_custkey = read_int_column(order_custkey_path);
         std::vector<int> customer_nation = read_int_column(customer_nation_path);
-
         if (orderkey.size() != quantity.size() ||
             orderkey.size() != price.size()) {
             throw std::runtime_error("Fact-column sizes do not match.");
         }
-
         const size_t rows = orderkey.size();
         const int order_count = static_cast<int>(order_custkey.size());
         const int customer_count = static_cast<int>(customer_nation.size());
@@ -1090,7 +1012,7 @@ int main() {
         const size_t logical_bytes = rows * sizeof(int) * 3;
         const double logical_gib = bytes_to_gib(logical_bytes);
         const double input_mib = bytes_to_mib(logical_bytes);
-
+        // Compute an independent full-data reference before running any split experiment.
         const unsigned long long reference = spja_cpu_rows(
             orderkey.data(),
             quantity.data(),
@@ -1102,10 +1024,9 @@ int main() {
             customer_count,
             target_nation
         );
-
+        // Offline compression is performed once and reported separately.
         const auto compression_start =
             std::chrono::high_resolution_clock::now();
-
         CompressedColumn comp_orderkey = compress_column_lz4_hc(
             orderkey.data(), rows, chunk_rows, lz4_hc_level
         );
@@ -1115,17 +1036,14 @@ int main() {
         CompressedColumn comp_price = compress_column_lz4_hc(
             price.data(), rows, chunk_rows, lz4_hc_level
         );
-
         const double offline_compression_ms = ms_between(
             compression_start,
             std::chrono::high_resolution_clock::now()
         );
-
         const size_t compressed_bytes =
             comp_orderkey.total_comp_bytes +
             comp_quantity.total_comp_bytes +
             comp_price.total_comp_bytes;
-
         std::cout << std::fixed << std::setprecision(3)
                   << "Rows: " << rows << '\n'
                   << "Logical input MiB: " << input_mib << '\n'
@@ -1134,22 +1052,19 @@ int main() {
                   << "Offline compression ms (excluded from all four graphs): "
                   << offline_compression_ms << '\n'
                   << "Reference result: " << reference << "\n\n";
-
+        // Standard split points: 100/0, 75/25, 50/50, 25/75, and 0/100 CPU/GPU.
         const std::vector<int> gpu_percents = {0, 25, 50, 75, 100};
         std::vector<SplitStats> all_splits;
-
         for (int gpu_percent : gpu_percents) {
             SplitStats split;
             split.gpu_percent = gpu_percent;
             split.cpu_percent = 100 - gpu_percent;
-
             const size_t gpu_chunk_count =
                 (total_chunks * static_cast<size_t>(gpu_percent)) / 100;
-
+            // Repeat each split with different fair chunk assignments to reduce placement bias.
             for (int trial = 0; trial < assignment_trials; ++trial) {
                 std::vector<size_t> cpu_ids;
                 std::vector<size_t> gpu_ids;
-
                 build_fair_assignment(
                     total_chunks,
                     gpu_chunk_count,
@@ -1157,17 +1072,14 @@ int main() {
                     cpu_ids,
                     gpu_ids
                 );
-
                 size_t cpu_rows = 0;
                 for (size_t chunk : cpu_ids) {
                     const size_t first = chunk * chunk_rows;
                     cpu_rows += std::min(chunk_rows, rows - first);
                 }
                 const size_t gpu_rows = rows - cpu_rows;
-
                 split.cpu_rows_avg += static_cast<double>(cpu_rows);
                 split.gpu_rows_avg += static_cast<double>(gpu_rows);
-
                 std::vector<GpuBatch> gpu_batches;
                 for (size_t begin = 0;
                      begin < gpu_ids.size();
@@ -1176,7 +1088,6 @@ int main() {
                         gpu_batch_chunks,
                         gpu_ids.size() - begin
                     );
-
                     gpu_batches.push_back(build_gpu_batch(
                         gpu_ids,
                         begin,
@@ -1191,24 +1102,22 @@ int main() {
                         comp_price
                     ));
                 }
-
                 if (gpu_batches.size() > MAX_GPU_BATCHES) {
                     throw std::runtime_error(
                         "More than two GPU batches were created. "
                         "Increase gpu_batch_chunks."
                     );
                 }
-
                 size_t split_compressed_gpu_bytes = 0;
                 for (const GpuBatch& batch : gpu_batches) {
                     split_compressed_gpu_bytes += batch.comp_bytes;
                 }
                 split.compressed_gpu_bytes_avg +=
                     static_cast<double>(split_compressed_gpu_bytes);
-
+                // Attempt to pin the host batch buffers. If registration fails, both compared
+                // modes fall back to pageable memory so the pair remains internally fair.
                 std::vector<void*> registered_buffers;
                 bool all_registered = true;
-
                 for (GpuBatch& batch : gpu_batches) {
                     void* pointers[] = {
                         batch.comp_flat.data(),
@@ -1222,32 +1131,26 @@ int main() {
                         batch.rows * sizeof(int),
                         batch.rows * sizeof(int)
                     };
-
                     for (int index = 0; index < 4; ++index) {
                         if (sizes[index] == 0) {
                             continue;
                         }
-
                         const cudaError_t status = cudaHostRegister(
                             pointers[index],
                             sizes[index],
                             cudaHostRegisterDefault
                         );
-
                         if (status != cudaSuccess) {
                             cudaGetLastError();
                             all_registered = false;
                             break;
                         }
-
                         registered_buffers.push_back(pointers[index]);
                     }
-
                     if (!all_registered) {
                         break;
                     }
                 }
-
                 if (!all_registered) {
                     for (void* pointer : registered_buffers) {
                         CUDA_CHECK(cudaHostUnregister(pointer));
@@ -1257,14 +1160,13 @@ int main() {
                         << "Warning: host registration failed; "
                         << "both comparisons use pageable host memory.\n";
                 }
-
                 GpuResources resources = create_gpu_resources(
                     gpu_batches,
                     order_custkey,
                     customer_nation,
                     chunk_bytes
                 );
-
+                // Alternate execution order across iterations to reduce systematic order effects.
                 auto execute_pair = [&]
                 (
                     Mode first_mode,
@@ -1273,7 +1175,6 @@ int main() {
                     ModeStats& second_stats
                 ) {
                     const int total_iterations = warmups + timed_runs;
-
                     for (int iteration = 0;
                          iteration < total_iterations;
                          ++iteration) {
@@ -1282,7 +1183,6 @@ int main() {
                             reverse_order ? second_mode : first_mode,
                             reverse_order ? first_mode : second_mode
                         };
-
                         for (Mode mode : order) {
                             RunResult run = run_mode(
                                 mode,
@@ -1304,20 +1204,17 @@ int main() {
                                 target_nation,
                                 cpu_threads
                             );
-
                             if (run.final_sum != reference) {
                                 throw std::runtime_error(
                                     std::string("Correctness mismatch in mode ") +
                                     mode_name(mode)
                                 );
                             }
-
                             if (iteration >= warmups) {
                                 ModeStats& destination =
                                     (mode == first_mode)
                                         ? first_stats
                                         : second_stats;
-
                                 record_run(
                                     destination,
                                     run,
@@ -1328,7 +1225,6 @@ int main() {
                         }
                     }
                 };
-
                 // Experiment 1 is measured independently.
                 // Both modes include H2D; only representation changes.
                 execute_pair(
@@ -1337,7 +1233,6 @@ int main() {
                     split.compression_uncompressed,
                     split.compression_compressed
                 );
-
                 // Experiment 2 is measured independently.
                 // Both modes are compressed; only timed H2D changes.
                 execute_pair(
@@ -1346,19 +1241,15 @@ int main() {
                     split.h2d_with,
                     split.h2d_without
                 );
-
                 destroy_gpu_resources(resources);
-
                 for (void* pointer : registered_buffers) {
                     CUDA_CHECK(cudaHostUnregister(pointer));
                 }
             }
-
             split.cpu_rows_avg /= static_cast<double>(assignment_trials);
             split.gpu_rows_avg /= static_cast<double>(assignment_trials);
             split.compressed_gpu_bytes_avg /=
                 static_cast<double>(assignment_trials);
-
             std::cout << split.cpu_percent << '/' << split.gpu_percent << '\n'
                       << "  Compression experiment:\n"
                       << "    UNCOMPRESSED: E2E="
@@ -1382,10 +1273,9 @@ int main() {
                       << " ms, TP="
                       << mean(split.h2d_without.throughput_gibps)
                       << " GiB/s\n";
-
             all_splits.push_back(std::move(split));
         }
-
+        // Persist the two controlled experiments in separate CSV files.
         const char* csv_header =
             "Experiment,Mode,Input_MiB,CPU_Percent,GPU_Percent,"
             "Assignment_Trials,Timed_Runs_Per_Assignment,"
@@ -1396,7 +1286,6 @@ int main() {
             "CPU_Path_ms_Avg,CPU_Path_ms_StdDev,"
             "GPU_Path_ms_Avg,GPU_Path_ms_StdDev,"
             "Final_Result,Reference_Result,Valid\n";
-
         std::ofstream compression_csv(compression_csv_path);
         if (!compression_csv) {
             throw std::runtime_error(
@@ -1404,7 +1293,6 @@ int main() {
             );
         }
         compression_csv << csv_header;
-
         std::ofstream h2d_csv(h2d_csv_path);
         if (!h2d_csv) {
             throw std::runtime_error(
@@ -1412,13 +1300,11 @@ int main() {
             );
         }
         h2d_csv << csv_header;
-
         for (const SplitStats& split : all_splits) {
             const double raw_h2d_bytes =
                 split.gpu_rows_avg * 3.0 * sizeof(int);
             const double compressed_h2d_bytes =
                 split.compressed_gpu_bytes_avg;
-
             write_result_row(
                 compression_csv,
                 "COMPRESSION",
@@ -1432,7 +1318,6 @@ int main() {
                 split.compression_uncompressed,
                 reference
             );
-
             write_result_row(
                 compression_csv,
                 "COMPRESSION",
@@ -1446,7 +1331,6 @@ int main() {
                 split.compression_compressed,
                 reference
             );
-
             write_result_row(
                 h2d_csv,
                 "H2D",
@@ -1460,7 +1344,6 @@ int main() {
                 split.h2d_with,
                 reference
             );
-
             write_result_row(
                 h2d_csv,
                 "H2D",
@@ -1475,14 +1358,11 @@ int main() {
                 reference
             );
         }
-
         compression_csv.close();
         h2d_csv.close();
-
         std::cout << "\nWrote:\n"
                   << "  " << compression_csv_path << '\n'
                   << "  " << h2d_csv_path << '\n';
-
         return 0;
     }
     catch (const std::exception& error) {
@@ -1491,14 +1371,19 @@ int main() {
     }
 }
 
-// nvcc -std=c++17 -O3 \
-//   -I ~/nvcomp_env/lib/python3.12/site-packages/nvidia/libnvcomp/include \
-//   src/benchmark/spja_lz4_nvcomp_four_modes.cu \
-//   -L ~/nvcomp_env/lib/python3.12/site-packages/nvidia/libnvcomp/lib64 \
-//   -lnvcomp \
-//   -llz4 \
-//   -o bin/spja_lz4_nvcomp_four_modes
-
-
-// LD_LIBRARY_PATH=~/nvcomp_env/lib/python3.12/site-packages/nvidia/libnvcomp/lib64:$LD_LIBRARY_PATH \
-// ./bin/spja_lz4_nvcomp_four_modes
+// Build:
+//
+// mkdir -p bin
+//
+// nvcc -std=c++17 -O3 -arch=sm_86 \
+//     -Xcompiler -pthread \
+//     -I $HOME/nvcomp_env/lib/python3.12/site-packages/nvidia/libnvcomp/include \
+//     src/benchmark/spja_lz4_nvcomp_four_modes.cu \
+//     -L $HOME/nvcomp_env/lib/python3.12/site-packages/nvidia/libnvcomp/lib64 \
+//     -lnvcomp -llz4 \
+//     -o bin/spja_lz4_nvcomp_four_modes
+//
+// Run:
+//
+// LD_LIBRARY_PATH=$HOME/nvcomp_env/lib/python3.12/site-packages/nvidia/libnvcomp/lib64:$LD_LIBRARY_PATH \
+//     ./bin/spja_lz4_nvcomp_four_modes

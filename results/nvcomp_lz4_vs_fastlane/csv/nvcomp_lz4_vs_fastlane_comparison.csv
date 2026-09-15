@@ -1,0 +1,4 @@
+Dataset,Layout,System,Avg_ms,Throughput_GBps,Compression_or_Encoding,Reduction_Percent,Status,SourceSF10 quantity 1x,No tweak,nvCOMP LZ4,25.178,9.53,LZ4_HC_level_6,62.641,OK,previous original-order SF10 runSF10 quantity 1x,No tweak,FastLanes-GPU,1.119,214.34,packed,,OK,previous original-order SF10 FastLanes runSorted SF10 quantity 23x,Sorted,nvCOMP LZ4,15.5928,238.493,LZ4_HC_level_6,99.6053,OK,results/nvcomp_lz4_vs_fastlane/csv/nvcomp_lz4_vs_fastlane_nvcomp_results.csv
+Sorted SF10 quantity 23x,Sorted,FastLanes-GPU,,,packed,,MISSING,results/baseline_fastlanes_gpu/quantity_sf10_sorted_lz4best_5gib/fastlanes_gpu/decompress_benchmark.txt
+Sorted SF10 quantity 45x,Sorted,nvCOMP LZ4,44.661,241.764,LZ4_HC_level_6,99.605,OK,previous successful 10GiB run
+Sorted SF10 quantity 45x,Sorted,FastLanes-GPU,,,,packed,,FAILED: CUDA out-of-memory / illegal memory access on RTX A2000 12GB,manual observed run failure

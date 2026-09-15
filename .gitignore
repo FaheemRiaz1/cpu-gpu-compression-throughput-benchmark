@@ -1,85 +1,145 @@
-# Compiled files
+# ============================================================
+# Compiled C/C++ artifacts
+# ============================================================
 *.o
+*.obj
 *.out
 *.exe
+*.a
+*.so
+*.so.*
 
-# CUDA build
+# ============================================================
+# CUDA build artifacts
+# ============================================================
 *.ptx
 *.cubin
+*.fatbin
 
-# Binaries
-bin/
+# ============================================================
+# Compiled executables
+# ============================================================
+/bin/
 
-# Python env
+# ============================================================
+# Build-system artifacts
+# ============================================================
+/build/
+/build_fmt/
+cmake-build-*/
+compile_commands.json
+.ninja_deps
+.ninja_log
+
+# ============================================================
+# Python environments and generated files
+# ============================================================
 venv/
+.venv/
+benchmark_env/
 
-# OS junk
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# ============================================================
+# IDE / editor files
+# ============================================================
+.vscode/
+.idea/
+*.swp
+*~
+
+# ============================================================
+# Operating-system generated files
+# ============================================================
 .DS_Store
+Thumbs.db
 
-# Logs
+# ============================================================
+# Logs and temporary files
+# ============================================================
 *.log
-
-# Temporary files
 *.tmp
 
-# Ignore large/unnecessary results (optional)
-results/*.txt
+# ============================================================
+# NVIDIA profiling output
+# ============================================================
+*.nsys-rep
+*.ncu-rep
+*.qdrep
 
-
-# ignoring backup files
-src/benchmark/spja_hybrid_cpu_gpu_split_backup.cu
-
-# Archives / old experiments
-archive/
-
-# Generated TPC-H binary data
-data/
+# ============================================================
+# Generated / large TPC-H data
+# ============================================================
+/data/
 *.bin
+*.dat
 
-# Local test files
-test
-c
+# Local TPC-H dbgen checkout
+tools/tpch-dbgen/
 
-# Compiled helper binaries inside scripts
-scripts/tpch_columnar/check_columnar_lz4_ratio
-scripts/tpch_columnar/check_columnar_lz4_delta_ratio
+# ============================================================
+# Archives and historical experiments
+# ============================================================
+/archive/
+
+# Historical SF1 backup result snapshots
+results/sf1_backup_csv/
+results/sf1_backup_graphs/
+
+# ============================================================
+# Obsolete / backup benchmark source variants
+# ============================================================
+src/benchmark/spja_hybrid_cpu_gpu_split_backup.cu
 src/benchmark/spja_cpu_gpu_split.cu
 src/benchmark/spja_dpf_fused_x401.cu
+
+# ============================================================
+# Obsolete SPJA result / plotting variants
+# ============================================================
 results/spja_workload/csv/spja_lz4_nvcomp_hybrid_split_results.csv
 results/spja_workload/graph_plotting/plot_overlap.py
 results/spja_workload/graphs/tpch_area_sweet_spot.png
-tools/tpch-dbgen/
-# External baseline source archives/code
-# external/
-results/nvcomp_lz4_vs_fastlane/summary
-build/ 
-build_fmt/
 
-# Large generated benchmark data
+# ============================================================
+# Local test / CUDA smoke-test files
+# ============================================================
+/test
+/c
+/C
+
+# ============================================================
+# Compiled helper binaries
+# ============================================================
+scripts/tpch_columnar/check_columnar_lz4_ratio
+scripts/tpch_columnar/check_columnar_lz4_delta_ratio
+
+# ============================================================
+# Large generated FastLanes benchmark datasets
+# ============================================================
 results/baseline_fastlanes_gpu/quantity_sf10/
 results/baseline_fastlanes_gpu/quantity_sf10_sorted_lz4best/
 results/baseline_fastlanes_gpu/quantity_sf10_sorted_lz4best_23x/
 results/baseline_fastlanes_gpu/quantity_sf10_sorted_lz4best_45x/
 
-
-
-results/nvcomp_lz4_vs_fastlane/
-*.dat
-*.bin
-
-# Keep FastLanes string benchmark files
+# ============================================================
+# External FastLanes source
+#
+# Keep only the thesis-specific FastLanes benchmark sources.
+# The complete upstream FastLanes source tree is not versioned
+# as part of this thesis repository.
+# ============================================================
 !external/
 external/*
+
 !external/baseline/
 external/baseline/*
+
 !external/baseline/fastlanes_gpu/
 external/baseline/fastlanes_gpu/*
-!external/baseline/fastlanes_gpu/spja_coproc_fastlanes_strings.cu
-!external/baseline/fastlanes_gpu/spja_coproc_fastlanes.cu
+
 !external/baseline/fastlanes_gpu/coproc_fastlanes.cu
-
-!scripts/run_fastlanes_spja_x40_strings.sh
-
-!results/fastlanes_lz4nvcomp_dowda/
-!results/fastlanes_lz4nvcomp_dowda/csv/
-!results/fastlanes_lz4nvcomp_dowda/csv/fastlanes_spja_coproc_x40_strings_results.csv
+!external/baseline/fastlanes_gpu/spja_coproc_fastlanes.cu
+!external/baseline/fastlanes_gpu/spja_coproc_fastlanes_strings.cu

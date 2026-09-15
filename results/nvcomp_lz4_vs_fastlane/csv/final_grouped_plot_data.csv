@@ -1,0 +1,5 @@
+Dataset,nvCOMP_LZ4_GBs,FastLanes_GBs,nvCOMP_Reduction,FastLanes_Label,Include
+228.829 MiB(Original SPJA),9.530,214.340,62.641,packed,YES
+228.829 MiB,225.386,214.404,99.605,packed,YES
+3.462 GiB,239.114,214.457,99.605,packed,YES
+10.056 GiB,241.764,0,99.605,FAILED,YES
